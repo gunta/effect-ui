@@ -712,6 +712,8 @@ const start = (
         log: record,
         slow: Context.get(ctx, services.SlowPhases)?.(ctx),
         onEmit: options?.onEmit,
+        // Only a recorder reads when renders start and end.
+        logsRenders: recording !== messageLog.silent,
         schedule: (task) => {
           const run = recording.follow()
           executor.schedule(() => {

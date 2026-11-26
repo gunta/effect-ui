@@ -84,7 +84,7 @@ Effect UI's bundle, 53 kB compressed, is about the size of React's (51 kB). Fold
 | uncompressed and compressed size | the JavaScript the page loads                                              |
 | first paint                      | from navigation to the first paint                                         |
 
-Every entry renders the same DOM, and the harness checks that each one is keyed: a row's DOM node follows its data when rows move or are removed. The Effect UI entry, like the Foldkit one, puts each row behind its lazy helper (`h.lazy` and `createKeyedLazy`), so a row whose data and selection haven't changed isn't built again.
+Every entry renders the same DOM, and the harness checks that each one is keyed: a row's DOM node follows its data when rows move or are removed. The Effect UI entry renders each row with `Html.template` and lists the rows with `h.list`, so a row whose data and selection haven't changed isn't built again, as Foldkit's `createKeyedLazy` does for its entry. The page around the table is a template too, with the rows in the slot that is the `tbody`'s only child, so a message patches the rows and nothing else on the page. The results above were measured at `6f86af8`, when the Effect UI entry put each row behind `h.lazy` instead.
 
 ## Versions
 

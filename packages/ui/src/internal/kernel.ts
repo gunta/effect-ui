@@ -67,6 +67,20 @@ export interface Host<N = any> {
   readonly kindOf?: ((node: N) => string) | undefined
   /** With `clone`: the record `setEvents` gave a node first. */
   readonly recOf?: ((node: N) => Rec | undefined) | undefined
+  /**
+   * With `clone`: the nodes of a copy whose root is `root`, read as `walk`
+   * says, with `root` first. A host that has it renders `View.template`'s
+   * elements from copies.
+   */
+  readonly pointsOf?:
+    | ((root: N, walk: View.TemplateDef["walk"]) => Array<N>)
+    | undefined
+  /**
+   * With `pointsOf`: marks `node` as the root of `record`, an element a
+   * template made. The host dispatches the events of its elements through
+   * the template's targets, finding the values in `record`.
+   */
+  readonly row?: ((node: N, record: Rec) => void) | undefined
   readonly commit?: (() => void) | undefined
   readonly unmounting?:
     | ((container: N, nodes: ReadonlyArray<N>) => void)
@@ -249,6 +263,10 @@ export interface Tree {
   readonly init: (inst: Instance) => Next
   readonly onEmit?: ((event: unknown) => unknown) | undefined
   readonly log?: Recorder | undefined
+  /** `false` when `log` has no use for renders starting and ending: they aren't logged then. */
+  readonly logsRenders?: boolean | undefined
+  /** The templates whose nodes this tree's host first built, which forget the host when the tree closes. */
+  templates?: Array<View.TemplateDef> | undefined
   readonly fallback?:
     | ((cause: Cause.Cause<unknown>) => View.Node<any, any>)
     | undefined
@@ -308,6 +326,8 @@ export class Rec {
   declare kids: Array<Rec> | undefined
   declare inst: Instance
   declare plain: boolean
+  /** For an element a template made, the nodes its slots write. */
+  declare points: Array<unknown> | undefined
   constructor(
     v: View.Node<any, any>,
     node: unknown,
@@ -319,6 +339,7 @@ export class Rec {
     this.kids = kids
     this.inst = inst
     this.plain = false
+    this.points = undefined
   }
 }
 
@@ -669,7 +690,7 @@ export const send = (
   if (next.viewTransition !== undefined) {
     transitions?.request(next.viewTransition)
   }
-  issueAll(inst, next, seq)
+  if (next.commands.length > 0) issueAll(inst, next, seq)
   applied(inst, next, seq)
 }
 
@@ -770,8 +791,9 @@ const byPathLength = (a: Instance, b: Instance): number =>
   b.path.length - a.path.length
 
 const renderDirty = (inst: Instance): void => {
-  const log = inst.tree.log
-  inst.tree.drew = true
+  const tree = inst.tree
+  const log = tree.logsRenders === false ? undefined : tree.log
+  tree.drew = true
   if (log !== undefined) log(inst, rendering)
   render(inst)
   if (log !== undefined) log(inst, rendered)
@@ -1051,6 +1073,11 @@ export const place = (
 }
 
 const remove = (inst: Instance, parent: unknown, rec: Rec): void => {
+  if (rec.node !== undefined) {
+    release(inst, rec)
+    inst.tree.host.remove(parent, rec.node)
+    return
+  }
   const nodes = nodesOf(rec, [])
   release(inst, rec)
   for (const node of nodes) inst.tree.host.remove(parent, node)
@@ -1286,18 +1313,34 @@ const setProps = (
 const createAll = (
   inst: Instance,
   parent: unknown,
-  views: ReadonlyArray<View.Node<any, any>>
+  views: ReadonlyArray<View.Node<any, any>>,
+  from = 0,
+  to = views.length,
+  before: unknown = null
 ): Array<Rec> => {
   const host = inst.tree.host
-  const kids: Array<Rec> = new Array(views.length)
+  const kids: Array<Rec> = new Array(to - from)
   let like: Rec | undefined
-  for (let index = 0; index < views.length; index++) {
+  for (let index = from; index < to; index++) {
     const view = views[index]!
+    if (
+      (view as View.TemplateNode)["~t"] !== undefined &&
+      host.pointsOf !== undefined
+    ) {
+      const made = kids[index - from] = createTemplate(
+        inst,
+        view as View.TemplateNode
+      )
+      host.insert(parent, made.node, before)
+      continue
+    }
     const copy = like === undefined ? undefined : createLike(inst, like, view)
-    if (copy !== undefined) place(host, parent, kids[index] = copy, null)
-    else {
-      const made = kids[index] = create(inst, view)
-      place(host, parent, made, null)
+    if (copy !== undefined) {
+      place(host, parent, kids[index - from] = copy, before)
+    } else {
+      const made = kids[index - from] = create(inst, view)
+      if (made.node !== undefined) host.insert(parent, made.node, before)
+      else place(host, parent, made, before)
       like = host.clone !== undefined && copies(made.v) ? made : undefined
     }
   }
@@ -1309,14 +1352,18 @@ const createAll = (
 // text holding nothing but attributes and handlers, so that a copy is what
 // `create` would build. An element with properties, a mount or a part's
 // layer isn't, and nor is a form, a script or a custom element, whose host
-// node is more than its attributes.
+// node is more than its attributes, or a template's, whose nodes carry its
+// record.
 const copies = (view: View.Node<any, any>): boolean =>
-  view._tag === "Element" && view.children.length > 0 && plainShape(view)
+  view._tag === "Element" && (view as View.TemplateNode)["~t"] === undefined &&
+  view.children.length > 0 && plainShape(view)
 
 const plainShape = (view: View.Node<any, any>): boolean => {
   if (view._tag === "Text") return true
   if (
-    view._tag !== "Element" || !View.isPlain(view) || !View.isPlainTag(view.tag)
+    view._tag !== "Element" ||
+    (view as View.TemplateNode)["~t"] !== undefined ||
+    !View.isPlain(view) || !View.isPlainTag(view.tag)
   ) return false
   const children = view.children
   for (let index = 0; index < children.length; index++) {
@@ -1339,7 +1386,7 @@ const createLike = (
   view: View.Node<any, any>
 ): Rec | undefined => {
   const was = like.v as View.Element<any, any>
-  if (view._tag !== "Element" || was.tag !== view.tag) return undefined
+  if (view._tag !== "Element" || !copiesAs(was, view)) return undefined
   const host = inst.tree.host
   const node = host.clone!(like.node)
   const rec = new Rec(
@@ -1416,13 +1463,14 @@ const untouched = (
 }
 
 // Whether `view` can be built from a copy of `prev`'s nodes, as far as the
-// element itself goes. Its tag is `prev`'s, which `plainShape` accepted.
+// element itself goes. Its tag is `prev`'s, which `plainShape` accepted. A
+// template's can't: its nodes are made from its own.
 const copiesAs = (
   prev: View.Element<any, any>,
   view: View.Element<any, any>
 ): boolean =>
-  prev.tag === view.tag && prev.children.length === view.children.length &&
-  View.isPlain(view)
+  prev.tag === view.tag && (view as View.TemplateNode)["~t"] === undefined &&
+  prev.children.length === view.children.length && View.isPlain(view)
 
 /**
  * The records of the kids of `rec`, an element whose view was `prev`, made
@@ -1498,6 +1546,248 @@ const rebuild = (
   return rec.kids = fresh.kids
 }
 
+// What a slot holds once given: `undefined`, `null` and `false` leave it out.
+const slotValue = (
+  values: Readonly<Record<string, unknown>>,
+  slot: string
+): unknown => {
+  const value = values[slot]
+  return value === null || value === false ? undefined : value
+}
+
+const writeHole = (
+  host: Host,
+  hole: View.TemplateHole,
+  node: unknown,
+  value: unknown,
+  was: unknown
+): void => {
+  if (hole.kind === "text") {
+    host.setText(node, value === undefined ? "" : String(value))
+  } else {
+    host.setAttr(
+      node,
+      hole.name,
+      value === undefined ? undefined : String(value),
+      was === undefined ? undefined : String(was)
+    )
+  }
+}
+
+// A template's element, built from a copy of the nodes the host built for
+// it, with its slots written.
+const createTemplate = (inst: Instance, view: View.TemplateNode): Rec => {
+  const host = inst.tree.host
+  const def = view["~t"]
+  let copy = def.lastHost === host ? def.lastCopy : def.copies.get(host)
+  // The first of the template on this host listens for its events.
+  const first = copy === undefined
+  if (first) {
+    def.copies.set(host, copy = create(inst, def.blank).node)
+    ;(inst.tree.templates ??= []).push(def)
+  }
+  def.lastHost = host
+  def.lastCopy = copy
+  const node = host.clone!(copy)
+  const points = host.pointsOf!(node, def.walk)
+  const values = view.values
+  // The copy holds a space in a text slot, so every one is written.
+  const texts = def.texts
+  for (let index = 0; index < texts.length; index++) {
+    const hole = texts[index]!
+    const value = values[hole.slot]
+    host.setText(
+      points[hole.point],
+      value === undefined || value === null || value === false
+        ? ""
+        : typeof value === "string"
+        ? value
+        : String(value)
+    )
+  }
+  // And nothing in an attribute slot.
+  const attrs = def.attrs
+  for (let index = 0; index < attrs.length; index++) {
+    const hole = attrs[index]!
+    const value = slotValue(values, hole.slot)
+    if (value !== undefined) {
+      writeHole(host, hole, points[hole.point], value, undefined)
+    }
+  }
+  // The host finds an element's handlers from the marked root, so only the
+  // first on this host listens for the events: through a record of its own,
+  // as a host, such as hydration's, may read the instance off it.
+  if (first) {
+    const handled = def.handled
+    for (let index = 0; index < handled.length; index++) {
+      host.setEvents(
+        node,
+        new Rec(handled[index]!.target as never, node, undefined, inst),
+        false
+      )
+    }
+  }
+  const rec = new Rec(view, node, def.parent ? unmade : undefined, inst)
+  rec.points = points
+  // A content slot holds text as a text slot does, or nodes.
+  const contents = def.contents
+  for (let index = 0; index < contents.length; index++) {
+    const hole = contents[index]!
+    const value = values[hole.slot]
+    if (Array.isArray(value)) fillContent(inst, rec, def, hole, value)
+    else host.setText(points[hole.point], textIn(value))
+  }
+  host.row?.(node, rec)
+  return rec
+}
+
+const noViews: ReadonlyArray<View.Node<any, any>> = Object.freeze([])
+
+const textIn = (value: unknown): string =>
+  value === undefined || value === null || value === false
+    ? ""
+    : typeof value === "string"
+    ? value
+    : String(value)
+
+// A content slot's nodes: a list `h.list` gave as it is, which keeps what it
+// says about how it changed, and any other array as `children` takes it.
+const nodesIn = (
+  value: ReadonlyArray<unknown>
+): ReadonlyArray<View.Node<any, any>> =>
+  View.isList(value) ? value : View.children(value as never)
+
+// What a content slot's record holds as its view: the nodes it holds, which
+// `patchKids` patches from, on an element with nothing to release.
+const contentView = (
+  children: ReadonlyArray<View.Node<any, any>>
+): View.Element<any, any> =>
+  ({ _tag: "Element", children, mount: undefined }) as unknown as View.Element<
+    any,
+    any
+  >
+
+// The records of a template's content slots, one for each, which the
+// template's record holds as its kids, so releasing it releases what they
+// hold. Made when a slot first holds nodes: a slot holding text needs none.
+const contentRecs = (
+  inst: Instance,
+  rec: Rec,
+  def: View.TemplateDef
+): Array<Rec> => {
+  if (rec.kids !== undefined && rec.kids !== unmade) return rec.kids
+  const contents = def.contents
+  const made: Array<Rec> = new Array(contents.length)
+  for (let index = 0; index < contents.length; index++) {
+    made[index] = new Rec(
+      contentView(noViews),
+      rec.points![contents[index]!.owner],
+      undefined,
+      inst
+    )
+  }
+  rec.kids = made
+  return made
+}
+
+// Puts nodes in a content slot that holds text: its text node is taken out,
+// and kept to put back if the slot holds text again.
+const fillContent = (
+  inst: Instance,
+  rec: Rec,
+  def: View.TemplateDef,
+  hole: View.TemplateHole,
+  value: ReadonlyArray<unknown>
+): void => {
+  const slot = contentRecs(inst, rec, def)[hole.index]!
+  slot.plain = false
+  const parent = rec.points![hole.owner]
+  const views = nodesIn(value)
+  inst.tree.host.remove(parent, rec.points![hole.point])
+  slot.kids = views.length > 0 ? createAll(inst, parent, views) : undefined
+  slot.v = contentView(views)
+}
+
+// Patches a content slot whose value was or is an array of nodes.
+const patchContent = (
+  inst: Instance,
+  rec: Rec,
+  hole: View.TemplateHole,
+  was: unknown,
+  value: unknown
+): void => {
+  if (!Array.isArray(was)) {
+    return fillContent(
+      inst,
+      rec,
+      (rec.v as View.TemplateNode)["~t"],
+      hole,
+      value as ReadonlyArray<unknown>
+    )
+  }
+  const host = inst.tree.host
+  const points = rec.points!
+  const parent = points[hole.owner]
+  const slot = rec.kids![hole.index]!
+  slot.plain = false
+  if (Array.isArray(value)) {
+    const views = nodesIn(value)
+    patchKids(inst, slot, parent, slot.v as View.Element<any, any>, views)
+    slot.v = contentView(views)
+    return
+  }
+  // Text again: the nodes go, and the text node comes back.
+  patchKids(inst, slot, parent, slot.v as View.Element<any, any>, noViews)
+  slot.v = contentView(noViews)
+  host.setText(points[hole.point], textIn(value))
+  host.insert(parent, points[hole.point], null)
+}
+
+// Patches an element a template made with the slots of the same template's
+// next one: only the slots whose values changed are written.
+const patchTemplate = (
+  inst: Instance,
+  rec: Rec,
+  prev: View.TemplateNode,
+  view: View.TemplateNode
+): void => {
+  rec.v = view
+  // Patched, so `restore` looks inside it again, as for any element.
+  rec.plain = false
+  const before = prev.values
+  const after = view.values
+  if (before === after) return
+  const host = inst.tree.host
+  // Handlers aren't among them: one is read off the values when its event comes.
+  const holes = view["~t"].writes
+  for (let index = 0; index < holes.length; index++) {
+    const hole = holes[index]!
+    const value = after[hole.slot]
+    const was = before[hole.slot]
+    if (value === was) continue
+    if (
+      hole.kind === "content" && (Array.isArray(value) || Array.isArray(was))
+    ) {
+      patchContent(inst, rec, hole, was, value)
+    } else if (hole.kind === "text" || hole.kind === "content") {
+      host.setText(
+        rec.points![hole.point],
+        value === undefined || value === null || value === false
+          ? ""
+          : String(value)
+      )
+    } else {
+      writeHole(
+        host,
+        hole,
+        rec.points![hole.point],
+        slotValue(after, hole.slot),
+        slotValue(before, hole.slot)
+      )
+    }
+  }
+}
+
 /** @internal */
 export const create = (inst: Instance, view: View.Node<any, any>): Rec => {
   const host = inst.tree.host
@@ -1505,6 +1795,10 @@ export const create = (inst: Instance, view: View.Node<any, any>): Rec => {
     case "Text":
       return new Rec(view, host.createText(view.text), undefined, inst)
     case "Element": {
+      if (
+        (view as View.TemplateNode)["~t"] !== undefined &&
+        host.pointsOf !== undefined
+      ) return createTemplate(inst, view as View.TemplateNode)
       if (view.owned?.length) view = owned(inst, view, view.owned)
       const node = host.createElement(view.tag)
       if (view.attrs !== View.noFields) setAttrs(host, node, view.attrs)
@@ -1576,7 +1870,8 @@ export const pairs = (
   switch (old._tag) {
     case "Element":
       return view._tag === "Element" && old.tag === view.tag &&
-        old.elementKey === view.elementKey
+        old.elementKey === view.elementKey &&
+        (old as View.TemplateNode)["~t"] === (view as View.TemplateNode)["~t"]
     case "Text":
       return view._tag === "Text"
     case "Child":
@@ -1813,6 +2108,18 @@ const patchElement = (
   prev: View.Element<any, any>,
   view: View.Element<any, any>
 ): void => {
+  const def = (view as View.TemplateNode)["~t"]
+  if (
+    def !== undefined && (prev as View.TemplateNode)["~t"] === def &&
+    rec.points !== undefined
+  ) {
+    return patchTemplate(
+      inst,
+      rec,
+      prev as View.TemplateNode,
+      view as View.TemplateNode
+    )
+  }
   const host = inst.tree.host
   // A row built from a copy makes its kids' records now, before anything is
   // written: if its nodes changed under it, it's built again from `prev`,
@@ -1833,14 +2140,53 @@ const patchElement = (
       prev.handlers === View.noFields && prev.eventOptions === View.noFields
     )
   }
-  const views = view.children
+  patchKids(inst, rec, node, prev, view.children)
+  patchRest(inst, rec, node, prev, view)
+}
+
+// Patches `rec`'s kids, made for `prev.children`, to `views`, in `node`:
+// an element's children, or the nodes a template's content slot holds.
+const patchKids = (
+  inst: Instance,
+  rec: Rec,
+  node: unknown,
+  prev: View.Element<any, any>,
+  views: ReadonlyArray<View.Node<any, any>>
+): void => {
+  const host = inst.tree.host
+  const before = prev.children
+  // The same children, such as a list `h.list` gave again, are the same
+  // nodes: nothing in them to patch, unless properties are set again.
+  if (
+    views === before && views.length > 0 &&
+    inst.tree.restores !== true
+  ) return
   const olds = rec.kids === unmade ? kidsOf(rec, prev) : rec.kids
   if (dev && views.length > 1) checkKeys(inst.path, views)
+  // Children `h.list` gave, which say how they changed: only those nodes.
+  const hint = olds === undefined ? undefined : View.takeListHint(views)
+  if (
+    hint !== undefined && views.length > 0 && hint.base === before &&
+    olds!.length === hint.base.length &&
+    inst.tree.restores !== true
+  ) {
+    if (hint.changed === undefined) {
+      if (hint.traded !== undefined) {
+        patchTraded(inst, node, olds!, views, hint.start, hint.traded)
+      } else rec.kids = patchSplice(inst, node, olds!, views, hint)
+      return
+    }
+    if (patchChanged(inst, olds!, views, hint.changed)) return
+  }
   if (olds === undefined) {
     if (views.length > 0) rec.kids = createAll(inst, node, views)
   } else if (views.length === 0) {
-    for (let index = 0; index < olds.length; index++) {
-      release(inst, olds[index]!)
+    // `release` has nothing to do in an instance with nothing live in it,
+    // such as a plain list's: not called for each of its rows then.
+    if (inst.live > 0) {
+      for (let index = 0; index < olds.length; index++) {
+        release(inst, olds[index]!)
+      }
     }
     if (host.clear !== undefined) host.clear(node)
     else {for (let index = 0; index < olds.length; index++) {
@@ -1855,11 +2201,126 @@ const patchElement = (
       old.v = next
     } else if (
       next._tag === "Element" && old.v !== next && old.v._tag === "Element" &&
-      old.v.tag === next.tag && old.v.elementKey === next.elementKey
+      old.v.tag === next.tag && old.v.elementKey === next.elementKey &&
+      (old.v as View.TemplateNode)["~t"] === (next as View.TemplateNode)["~t"]
     ) {
       patchElement(inst, old, old.v, next)
     } else olds[0] = patch(inst, old, next)
   } else rec.kids = patchList(inst, node, olds, views, null, true)
+}
+
+// Patches only the kids at `changed`, the indexes where a list `h.list` gave
+// differs from the one before: each in its place, so only if each still
+// pairs with the one there. Whether it did.
+const patchChanged = (
+  inst: Instance,
+  olds: Array<Rec>,
+  views: ReadonlyArray<View.Node<any, any>>,
+  changed: ReadonlyArray<number>
+): boolean => {
+  // A kid that doesn't pair stops it: the ones before it are patched, and
+  // `patchList`, which takes over, keeps them as they are.
+  for (let index = 0; index < changed.length; index++) {
+    const at = changed[index]!
+    const old = olds[at]!
+    const prev = old.v
+    const view = views[at]!
+    if (prev === view) continue
+    if (
+      old.points !== undefined && view._tag === "Element" &&
+      (view as View.TemplateNode)["~t"] === (prev as View.TemplateNode)["~t"] &&
+      view.elementKey === (prev as View.Element<any, any>).elementKey
+    ) {
+      patchTemplate(
+        inst,
+        old,
+        prev as View.TemplateNode,
+        view as View.TemplateNode
+      )
+    } else if (pairs(prev, view)) olds[at] = patchPaired(inst, old, prev, view)
+    else return false
+  }
+  return true
+}
+
+// Patches the kids of an element whose children were a list `h.list` gave
+// with the nodes at `start` and `end` traded, the rest as they were: those
+// two records trade places in `olds`, which the element keeps, and their
+// nodes move, only one of them if they're neighbours, as `patchSwap` does.
+const patchTraded = (
+  inst: Instance,
+  parent: unknown,
+  olds: Array<Rec>,
+  views: ReadonlyArray<View.Node<any, any>>,
+  start: number,
+  end: number
+): void => {
+  const host = inst.tree.host
+  const kept = inst.tree.restores !== true
+  const first = olds[end]!
+  const last = olds[start]!
+  olds[start] = first.v === views[start] && kept
+    ? first
+    : patch(inst, first, views[start]!)
+  olds[end] = last.v === views[end] && kept
+    ? last
+    : patch(inst, last, views[end]!)
+  place(host, parent, olds[start]!, nodeOf(olds[end]!))
+  if (end > start + 1) {
+    place(
+      host,
+      parent,
+      olds[end]!,
+      end + 1 < views.length ? nodeOf(olds[end + 1]!) : null
+    )
+  }
+}
+
+// Patches the kids of an element whose children were a list `h.list` gave
+// with nodes inserted or removed in one place, as `splice` says: only those
+// are created or removed, and the rest keep their records and nodes.
+const patchSplice = (
+  inst: Instance,
+  parent: unknown,
+  olds: Array<Rec>,
+  views: ReadonlyArray<View.Node<any, any>>,
+  splice: View.ListHint
+): Array<Rec> => {
+  const { added, removed, start } = splice
+  for (let index = start; index < start + removed; index++) {
+    remove(inst, parent, olds[index]!)
+  }
+  if (added === 0) {
+    const out = olds.slice()
+    out.splice(start, removed)
+    return out
+  }
+  const made = createAll(
+    inst,
+    parent,
+    views,
+    start,
+    start + added,
+    start < olds.length ? nodeOf(olds[start]!) : null
+  )
+  const out: Array<Rec> = new Array(views.length)
+  for (let index = 0; index < start; index++) out[index] = olds[index]!
+  for (let index = 0; index < added; index++) out[start + index] = made[index]!
+  for (let index = start + added; index < views.length; index++) {
+    out[index] = olds[index - added]!
+  }
+  return out
+}
+
+// What `patchElement` does after the children: properties and the mount.
+const patchRest = (
+  inst: Instance,
+  rec: Rec,
+  node: unknown,
+  prev: View.Element<any, any>,
+  view: View.Element<any, any>
+): void => {
+  const host = inst.tree.host
   // After the children, so a select's value wins over its options'.
   if (
     prev.props !== view.props ||
@@ -1921,8 +2382,22 @@ const patchList = (
       out[start] = kept ? old : patch(inst, old, view)
     } else if (prev._tag === "Element" && view._tag === "Element") {
       // `pairs` and `patchPaired` for the common case, written out.
-      if (prev.tag !== view.tag || prev.elementKey !== view.elementKey) break
-      patchElement(inst, old, prev, view)
+      if (
+        prev.tag !== view.tag || prev.elementKey !== view.elementKey ||
+        (prev as View.TemplateNode)["~t"] !== (view as View.TemplateNode)["~t"]
+      ) break
+      const def = (view as View.TemplateNode)["~t"]
+      if (
+        def !== undefined && (prev as View.TemplateNode)["~t"] === def &&
+        old.points !== undefined
+      ) {
+        patchTemplate(
+          inst,
+          old,
+          prev as View.TemplateNode,
+          view as View.TemplateNode
+        )
+      } else patchElement(inst, old, prev, view)
       out[start] = old
     } else if (pairs(prev, view)) {
       out[start] = patchPaired(inst, old, prev, view)
@@ -1940,7 +2415,10 @@ const patchList = (
   while (start <= oldEnd && start <= end) {
     const prev = olds[oldEnd]!.v
     const view = views[end]!
-    if (prev !== view && !pairs(prev, view)) break
+    if (prev === view) {
+      // Kept as it is, so set here: the loop after the middle skips it.
+      if (kept && out !== olds) out[end] = olds[oldEnd]!
+    } else if (!pairs(prev, view)) break
     oldEnd--
     end--
   }
@@ -2005,8 +2483,10 @@ const patchList = (
   }
   if (gone !== undefined) {
     if (whole && gone.length === olds.length && host.clear !== undefined) {
-      for (let index = 0; index < olds.length; index++) {
-        release(inst, olds[index]!)
+      if (inst.live > 0) {
+        for (let index = 0; index < olds.length; index++) {
+          release(inst, olds[index]!)
+        }
       }
       host.clear(parent)
     } else for (const old of gone) remove(inst, parent, old)
@@ -2016,6 +2496,7 @@ const patchList = (
     index < views.length;
     index++
   ) {
+    if (out[index] !== undefined && out !== olds) continue
     const old = olds[index + shift]!
     const view = views[index]!
     out[index] = old.v === view && kept ? old : patch(inst, old, view)
@@ -2147,6 +2628,7 @@ export interface Options {
   readonly path?: string | undefined
   readonly context?: Context.Context<any> | undefined
   readonly log?: Recorder | undefined
+  readonly logsRenders?: Tree["logsRenders"]
   readonly fallback?: Tree["fallback"]
   readonly init?: Tree["init"] | undefined
   readonly onEmit?: Tree["onEmit"]
@@ -2207,6 +2689,19 @@ export const mount = (
       close(instance)
       unplace(host, container, instance.rendered!)
       host.commit?.()
+      // A template defined for the whole program would otherwise keep this
+      // host, and the container it holds, until another host renders it.
+      const templates = tree.templates
+      if (templates !== undefined) {
+        for (let index = 0; index < templates.length; index++) {
+          const def = templates[index]!
+          if (def.lastHost === host) {
+            def.lastHost = undefined
+            def.lastCopy = undefined
+          }
+        }
+        tree.templates = undefined
+      }
     }
   }
 }

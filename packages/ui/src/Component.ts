@@ -895,6 +895,10 @@ export type StepRequirements<U> = NamedRequirement<RawStepRequirements<U>>
 type RawStepRequirements<U> = U extends
   InitStep<infer _Model, infer _Msg, infer _Events, infer R> ? R : never
 
+// The effects of an `init` or `update` that returned a bare Model: shared, and frozen, since `init` hands
+// them to its caller.
+const noEffects: ReadonlyArray<never> = Object.freeze([])
+
 const StepProto = {
   [StepTypeId]: StepTypeId,
   pipe() {
@@ -1004,6 +1008,13 @@ type AnyUpdate$ = Update<any, any, any, any> & {
 
 const UpdateProto = {
   ...StepProto,
+  // What every update starts with, read from here: `UpdateOf` sets only what
+  // differs from one message to the next.
+  commands: noEffects,
+  emitted: noEffects,
+  lists: noEffects,
+  sends: noEffects,
+  viewTransitionTypes: undefined,
   send(this: AnyUpdate$, target: Headless.Any | "self", message: unknown) {
     return StepProto.send.call(
       this,
@@ -1066,11 +1077,6 @@ function UpdateOf(
   self: unknown
 ) {
   this.model = model
-  this.commands = noEffects
-  this.emitted = noEffects
-  this.lists = noEffects
-  this.sends = noEffects
-  this.viewTransitionTypes = undefined
   this.props = props
   this.queries = queries
   this.reads = reads
@@ -1078,6 +1084,9 @@ function UpdateOf(
   this["~self"] = self
 }
 UpdateOf.prototype = UpdateProto
+
+// What `$.queries` holds for a component without queries: one for all of them.
+const noQueries = Object.freeze({})
 
 const toUpdateFn = (
   update: AnyUpdate | { readonly [tag: string]: AnyUpdate }
@@ -1105,10 +1114,6 @@ const makeInit = (props: unknown): Init<any, any, any, any> => ({
   set: initSet
 })
 
-// The effects of an `init` or `update` that returned a bare Model: shared, and frozen, since `init` hands
-// them to its caller.
-const noEffects: ReadonlyArray<never> = Object.freeze([])
-
 /**
  * Returns `true` if `u` is a step.
  *
@@ -1121,12 +1126,13 @@ export const isStep = (
 ): u is InitStep<unknown, unknown, unknown, unknown> =>
   Predicate.hasProperty(u, StepTypeId)
 
+// `isStep`, in place: this runs for every message.
 const toNext = (result: unknown): Next<any, any, any, any> =>
-  isStep(result)
+  typeof result === "object" && result !== null && StepTypeId in result
     ? {
-      model: result.model,
-      commands: result.commands,
-      events: result.emitted,
+      model: (result as Step<any, any, any>).model,
+      commands: (result as Step<any, any, any>).commands,
+      events: (result as Step<any, any, any>).emitted,
       lists: (result as Step<any, any, any>).lists,
       sends: (result as Step<any, any, any>).sends,
       viewTransition: (result as Step<any, any, any>).viewTransitionTypes
@@ -2305,9 +2311,12 @@ const Proto = Object.assign(Object.create(Function.prototype), {
     } else if (this.subscriptions !== undefined) {
       subscriptionCore.loaded?.(inst as never)
     }
-    if (sharing(this) || (next as Next<any, any, any, any>)?.sends?.length) {
-      sharedRun.sync(inst as never, next as never, seq as never)
-    }
+    // `sharing`, in place: this runs after every message.
+    const definition = this.definition
+    if (
+      definition.shares !== undefined || definition.reads !== undefined ||
+      (next as Next<any, any, any, any>)?.sends?.length
+    ) sharedRun.sync(inst as never, next as never, seq as never)
   },
   "~first"(this: Any, inst: unknown) {
     if (sharing(this)) sharedRun.first(inst as never)
@@ -3787,7 +3796,9 @@ const finish = (
     props: unknown,
     results: Results | undefined
   ): any =>
-    bound === undefined ? {} : bound.context(model, props, results).queries
+    bound === undefined
+      ? noQueries
+      : bound.context(model, props, results).queries
   const updateFn = toUpdateFn(options.update)
   const subscriptions = options.subscriptions
   const head = options.head
@@ -3829,10 +3840,10 @@ const finish = (
       ) =>
         toNext(
           updateFn(
-            makeUpdate(
+            new (UpdateOf as any)(
               model,
               props,
-              open(model, props, results),
+              bound === undefined ? noQueries : open(model, props, results),
               shared === undefined
                 ? unsupplied
                 : typeof shared === "function"
@@ -3876,6 +3887,7 @@ const finish = (
           try {
             const node = View.toNode(view(h, model))
             lazies?.end()
+            lazies?.endLists()
             return node
           } catch (error) {
             // What a render that threw built isn't given again.
