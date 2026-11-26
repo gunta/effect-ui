@@ -394,6 +394,8 @@ const between = (
 
   const host: Kernel.Host<Node> = {
     ...base,
+    // Adopting nodes, it creates each one.
+    clone: undefined,
     createElement(tag) {
       const node = take(tag)
       if (node === null) {

@@ -56,7 +56,8 @@ const methods = [
   "setAttr",
   "setProp",
   "made",
-  "insert"
+  "insert",
+  "clone"
 ] as const
 
 const use = (target: Kernel.Host, from: Kernel.Host): void => {

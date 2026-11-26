@@ -52,6 +52,17 @@ export interface Host<N = any> {
   readonly createContainer?: (() => N) | undefined
   readonly parentOf: (node: N) => N
   readonly nextOf: (node: N) => N | null
+  /**
+   * A deep copy of a node and its descendants, with their attributes and text,
+   * and `firstOf` its first child. With both, a list of siblings of the same
+   * shape is built by copying the one before. A host that adopts nodes, as
+   * hydration does, leaves them out.
+   */
+  readonly clone?: ((node: N) => N) | undefined
+  readonly firstOf?: ((node: N) => N | null) | undefined
+  /** With `clone`: whether a node is text, and the record `setEvents` gave it first. */
+  readonly isText?: ((node: N) => boolean) | undefined
+  readonly recOf?: ((node: N) => Rec | undefined) | undefined
   readonly commit?: (() => void) | undefined
   readonly unmounting?:
     | ((container: N, nodes: ReadonlyArray<N>) => void)
@@ -265,11 +276,23 @@ export interface Tree {
     | ((child: Instance, inst: Instance, view: View.Child<any, any>) => boolean)
     | undefined
   held?: ((at: string) => boolean) | undefined
+  /** Whether an element of the tree has had properties, which a patch that keeps a node sets again. */
+  props?: boolean | undefined
   dirty: Array<Instance>
   scheduled: boolean
   flushing: boolean
   closed: boolean
 }
+
+/**
+ * The `kids` of an element built from a copy, until a patch needs them: the
+ * element and everything in it are elements and text with nothing to
+ * release or restore, so a reader that looks for components, mounts or refs
+ * finds none, as it would in the records. `kidsOf` makes them.
+ *
+ * @internal
+ */
+export const unmade: Array<Rec> = Object.freeze([]) as unknown as Array<Rec>
 
 /** @internal */
 export class Rec {
@@ -1248,6 +1271,226 @@ const setProps = (
   for (const name in props) host.setProp(node, name, props[name])
 }
 
+/**
+ * Creates `views` and places them in `parent`, each after the one before. A
+ * view of the same shape as the one before it is built from a copy of that
+ * one's host nodes.
+ */
+const createAll = (
+  inst: Instance,
+  parent: unknown,
+  views: ReadonlyArray<View.Node<any, any>>
+): Array<Rec> => {
+  const host = inst.tree.host
+  const kids: Array<Rec> = new Array(views.length)
+  let like: Rec | undefined
+  for (let index = 0; index < views.length; index++) {
+    const view = views[index]!
+    const copy = like === undefined ? undefined : createLike(inst, like, view)
+    if (copy !== undefined) place(host, parent, kids[index] = copy, null)
+    else {
+      const made = kids[index] = create(inst, view)
+      place(host, parent, made, null)
+      like = host.clone !== undefined && copies(made.v) ? made : undefined
+    }
+  }
+  return kids
+}
+
+// Whether a created element's host nodes can be copied for its siblings, so
+// long as nothing has touched them since: one with children, all elements and
+// text holding nothing but attributes and handlers, so that a copy is what
+// `create` would build. An element with properties, a mount or a part's
+// layer isn't, and nor is a form, a script or a custom element, whose host
+// node is more than its attributes.
+const copies = (view: View.Node<any, any>): boolean =>
+  view._tag === "Element" && view.children.length > 0 && plainShape(view)
+
+const plainShape = (view: View.Node<any, any>): boolean => {
+  if (view._tag === "Text") return true
+  if (
+    view._tag !== "Element" || view.props !== View.noFields ||
+    view.mount !== undefined || view.refKey !== undefined ||
+    (view.owned !== undefined && view.owned.length > 0) ||
+    view.tag === "form" || view.tag === "script" || view.tag.includes("-")
+  ) return false
+  const children = view.children
+  for (let index = 0; index < children.length; index++) {
+    if (!plainShape(children[index]!)) return false
+  }
+  return true
+}
+
+// Builds `view` from a copy of the host nodes of `like`, an element `copies`
+// accepted, writing only the attributes and text that differ. `undefined`
+// when `view` doesn't have the shape of `like`: the same tags and text in
+// the same places, holding nothing else. The copy is then dropped.
+//
+// Only the root and the elements with handlers get records: the others are
+// made when a patch first needs them, see `kidsOf`. A list of rows built
+// this way keeps a few objects per row, not one per node.
+const createLike = (
+  inst: Instance,
+  like: Rec,
+  view: View.Node<any, any>
+): Rec | undefined => {
+  const was = like.v as View.Element<any, any>
+  if (view._tag !== "Element" || was.tag !== view.tag) return undefined
+  const host = inst.tree.host
+  const node = host.clone!(like.node)
+  const rec = new Rec(
+    view,
+    node,
+    view.children.length > 0 ? unmade : undefined,
+    inst
+  )
+  return fill(inst, host, was, view, node, rec) ? rec : undefined
+}
+
+// Whether `view` has the shape of `was`, writing what differs into `node`,
+// a copy of the nodes of `was`. `rec` is the record of `node`, if it has one.
+const fill = (
+  inst: Instance,
+  host: Host,
+  was: View.Node<any, any>,
+  view: View.Node<any, any>,
+  node: unknown,
+  rec: Rec | undefined
+): boolean => {
+  if (was._tag === "Text") {
+    if (view._tag !== "Text") return false
+    if (was.text !== view.text) host.setText(node, view.text)
+    return true
+  }
+  const prev = was as View.Element<any, any>
+  if (view._tag !== "Element" || !copiesAs(prev, view)) return false
+  if (prev.attrs !== view.attrs) patchAttrs(host, node, prev.attrs, view.attrs)
+  const views = view.children
+  if (views.length > 0) {
+    if (dev && views.length > 1) checkKeys(inst.path, views)
+    const befores = prev.children
+    // The host node of `views[at]`, read only when a kid needs its own: a
+    // node read from the host can cost an object, as a DOM node does.
+    let child: unknown = undefined
+    let at = -1
+    for (let index = 0; index < views.length; index++) {
+      const before = befores[index]!
+      const kid = views[index]!
+      if (untouched(before, kid)) continue
+      if (at < 0) {
+        child = host.firstOf!(node)
+        at = 0
+      }
+      for (; at < index; at++) child = host.nextOf(child)
+      if (!fill(inst, host, before, kid, child, undefined)) return false
+    }
+  }
+  if (view.handlers !== View.noFields || view.eventOptions !== View.noFields) {
+    host.setEvents(
+      node,
+      rec ?? new Rec(view, node, views.length > 0 ? unmade : undefined, inst),
+      true
+    )
+  }
+  return true
+}
+
+// Whether a copy of `was`'s node is already `view`'s, so `fill` has nothing
+// to write to it: the same text, or the same element without children or
+// handlers.
+const untouched = (
+  was: View.Node<any, any>,
+  view: View.Node<any, any>
+): boolean => {
+  if (was === view) return true
+  if (was._tag === "Text") return view._tag === "Text" && was.text === view.text
+  return view._tag === "Element" && view.children.length === 0 &&
+    view.handlers === View.noFields && view.eventOptions === View.noFields &&
+    copiesAs(was as View.Element<any, any>, view) &&
+    sameAttrs((was as View.Element<any, any>).attrs, view.attrs)
+}
+
+// Whether `view` can be built from a copy of `prev`'s nodes, as far as the
+// element itself goes.
+const copiesAs = (
+  prev: View.Element<any, any>,
+  view: View.Element<any, any>
+): boolean =>
+  prev.tag === view.tag && prev.children.length === view.children.length &&
+  view.props === View.noFields && view.mount === undefined &&
+  view.refKey === undefined &&
+  (view.owned === undefined || view.owned.length === 0)
+
+/**
+ * The records of the kids of `rec`, an element whose view was `prev`, made
+ * if `createLike` left them `unmade`: read off the host nodes, keeping the
+ * records the elements with handlers already have. If the nodes no longer
+ * match `prev`, because something other than the runtime changed them, the
+ * element is built again.
+ *
+ * @internal
+ */
+export const kidsOf = (
+  rec: Rec,
+  prev: View.Element<any, any>
+): Array<Rec> | undefined => {
+  const kids = rec.kids
+  if (kids !== unmade) return kids
+  const host = rec.inst.tree.host
+  const views = prev.children
+  const made: Array<Rec> = new Array(views.length)
+  let child = host.firstOf!(rec.node)
+  for (let index = 0; index < views.length; index++) {
+    const view = views[index]!
+    if (child === null || host.isText!(child) !== (view._tag === "Text")) {
+      return rebuild(rec, prev)
+    }
+    if (view._tag === "Text") {
+      made[index] = new Rec(view, child, undefined, rec.inst)
+    } else {
+      let kid = host.recOf?.(child)
+      if (kid === undefined || kid.v !== view) {
+        kid = new Rec(
+          view,
+          child,
+          (view as View.Element<any, any>).children.length > 0
+            ? unmade
+            : undefined,
+          rec.inst
+        )
+        if (
+          (view as View.Element<any, any>).handlers !== View.noFields ||
+          (view as View.Element<any, any>).eventOptions !== View.noFields
+        ) host.setEvents(child, kid, true)
+      }
+      made[index] = kid
+    }
+    child = host.nextOf(child)
+  }
+  if (child !== null) return rebuild(rec, prev)
+  return rec.kids = made
+}
+
+// Builds `rec`'s element again from `prev`, its view, in place of nodes that
+// changed under it.
+const rebuild = (
+  rec: Rec,
+  prev: View.Element<any, any>
+): Array<Rec> | undefined => {
+  const host = rec.inst.tree.host
+  const fresh = create(rec.inst, prev)
+  const parent = host.parentOf(rec.node)
+  if (parent !== null && parent !== undefined) {
+    host.insert(parent, fresh.node, rec.node)
+    host.remove(parent, rec.node)
+  }
+  rec.node = fresh.node
+  if (prev.handlers !== View.noFields || prev.eventOptions !== View.noFields) {
+    host.setEvents(fresh.node, rec, true)
+  }
+  return rec.kids = fresh.kids
+}
+
 /** @internal */
 export const create = (inst: Instance, view: View.Node<any, any>): Rec => {
   const host = inst.tree.host
@@ -1261,13 +1504,11 @@ export const create = (inst: Instance, view: View.Node<any, any>): Rec => {
       const views = view.children
       let kids: Array<Rec> | undefined
       if (dev && views.length > 1) checkKeys(inst.path, views)
-      if (views.length > 0) {
-        kids = new Array(views.length)
-        for (let index = 0; index < views.length; index++) {
-          place(host, node, kids[index] = create(inst, views[index]!), null)
-        }
+      if (views.length > 0) kids = createAll(inst, node, views)
+      if (view.props !== View.noFields) {
+        inst.tree.props = true
+        setProps(host, node, view.props)
       }
-      if (view.props !== View.noFields) setProps(host, node, view.props)
       host.made?.(node, inst)
       const rec = new Rec(view, node, kids, inst)
       if (
@@ -1340,12 +1581,23 @@ export const pairs = (
 const patch = (inst: Instance, old: Rec, view: View.Node<any, any>): Rec => {
   const prev = old.v
   if (prev === view) {
-    if (inst.tree.host.controlled !== undefined && view._tag === "Element") {
-      restore(inst.tree.host, old)
-    }
+    if (
+      inst.tree.props === true && view._tag === "Element" &&
+      inst.tree.host.controlled !== undefined
+    ) restore(inst.tree.host, old)
     return old
   }
   if (!pairs(prev, view)) return replace(inst, old, view)
+  return patchPaired(inst, old, prev, view)
+}
+
+// `patch`, for a view that `pairs` with the one before, `prev`, and isn't it.
+const patchPaired = (
+  inst: Instance,
+  old: Rec,
+  prev: View.Node<any, any>,
+  view: View.Node<any, any>
+): Rec => {
   switch (view._tag) {
     case "Text":
       if ((prev as View.Text).text !== view.text) {
@@ -1489,7 +1741,13 @@ const patchAttrs = (
   before: Readonly<Record<string, string>>,
   attrs: Readonly<Record<string, string>>
 ): void => {
-  if (sameAttrs(before, attrs)) return
+  // Records that differ by being empty differ: only two full ones are read.
+  if (
+    before !== View.noFields && attrs !== View.noFields &&
+    sameAttrs(before, attrs)
+  ) {
+    return
+  }
   if (host.normalizeAttrs !== undefined) {
     before = host.normalizeAttrs(node, before)
     attrs = host.normalizeAttrs(node, attrs)
@@ -1546,16 +1804,10 @@ const patchElement = (
     )
   }
   const views = view.children
-  const olds = rec.kids
+  const olds = rec.kids === unmade ? kidsOf(rec, prev) : rec.kids
   if (dev && views.length > 1) checkKeys(inst.path, views)
   if (olds === undefined) {
-    if (views.length > 0) {
-      const kids: Array<Rec> = new Array(views.length)
-      for (let index = 0; index < views.length; index++) {
-        place(host, node, kids[index] = create(inst, views[index]!), null)
-      }
-      rec.kids = kids
-    }
+    if (views.length > 0) rec.kids = createAll(inst, node, views)
   } else if (views.length === 0) {
     for (let index = 0; index < olds.length; index++) {
       release(inst, olds[index]!)
@@ -1572,9 +1824,10 @@ const patchElement = (
       if (old.v.text !== next.text) host.setText(old.node, next.text)
       old.v = next
     } else if (
-      next._tag === "Element" && old.v !== next && pairs(old.v, next)
+      next._tag === "Element" && old.v !== next && old.v._tag === "Element" &&
+      old.v.tag === next.tag && old.v.elementKey === next.elementKey
     ) {
-      patchElement(inst, old, old.v as View.Element<any, any>, next)
+      patchElement(inst, old, old.v, next)
     } else olds[0] = patch(inst, old, next)
   } else rec.kids = patchList(inst, node, olds, views, null, true)
   // After the children, so a select's value wins over its options'.
@@ -1582,6 +1835,7 @@ const patchElement = (
     prev.props !== view.props ||
     (host.controlled !== undefined && view.props !== View.noFields)
   ) {
+    if (view.props !== View.noFields) inst.tree.props = true
     patchProps(host, node, prev.props, view.props)
   }
   const mount = view.mount as unknown as Attachable | undefined
@@ -1624,10 +1878,23 @@ const patchList = (
   let oldEnd = olds.length - 1
   let end = views.length - 1
   let out: Array<Rec> = oldEnd === end ? olds : new Array(views.length)
-  while (
-    start <= oldEnd && start <= end && pairs(olds[start]!.v, views[start]!)
-  ) {
-    out[start] = patch(inst, olds[start]!, views[start]!)
+  // A node given again as it was, such as `h.lazy`'s, is kept without a
+  // call, unless the tree has properties to set again.
+  const kept = inst.tree.props !== true || host.controlled === undefined
+  while (start <= oldEnd && start <= end) {
+    const old = olds[start]!
+    const view = views[start]!
+    const prev = old.v
+    if (prev === view) {
+      out[start] = kept ? old : patch(inst, old, view)
+    } else if (prev._tag === "Element" && view._tag === "Element") {
+      // `pairs` and `patchPaired` for the common case, written out.
+      if (prev.tag !== view.tag || prev.elementKey !== view.elementKey) break
+      patchElement(inst, old, prev, view)
+      out[start] = old
+    } else if (pairs(prev, view)) {
+      out[start] = patchPaired(inst, old, prev, view)
+    } else break
     start++
   }
   if (out === olds) {
@@ -1635,12 +1902,18 @@ const patchList = (
     out = new Array(views.length)
     for (let index = 0; index < start; index++) out[index] = olds[index]!
   }
-  while (
-    start <= oldEnd && start <= end &&
-    pairs(olds[oldEnd]!.v, views[end]!)
-  ) {
+  // An unkeyed element pairs with the last one even when rows were added or
+  // removed before it, so it keeps its node. The same view is kept without
+  // `pairs`.
+  while (start <= oldEnd && start <= end) {
+    const prev = olds[oldEnd]!.v
+    const view = views[end]!
+    if (prev !== view && !pairs(prev, view)) break
     oldEnd--
     end--
+  }
+  if (oldEnd === end && start < end && swaps(olds, views, start, end)) {
+    return patchSwap(inst, parent, olds, views, out, start, end, after)
   }
   const count = end - start + 1
   const sources = count > 0 && start <= oldEnd
@@ -1683,11 +1956,20 @@ const patchList = (
       else last = to
     } else (gone ??= []).push(old)
   }
+  let like: Rec | undefined
   for (let index = start; index <= end; index++) {
     const source = sources === undefined ? 0 : sources[index - start]!
-    out[index] = source === 0
-      ? create(inst, views[index]!)
-      : patch(inst, olds[source - 1]!, views[index]!)
+    if (source !== 0) {
+      out[index] = patch(inst, olds[source - 1]!, views[index]!)
+      continue
+    }
+    const view = views[index]!
+    const copy = like === undefined ? undefined : createLike(inst, like, view)
+    if (copy !== undefined) out[index] = copy
+    else {
+      const made = out[index] = create(inst, view)
+      like = host.clone !== undefined && copies(made.v) ? made : undefined
+    }
   }
   if (gone !== undefined) {
     if (whole && gone.length === olds.length && host.clear !== undefined) {
@@ -1697,12 +1979,14 @@ const patchList = (
       host.clear(parent)
     } else for (const old of gone) remove(inst, parent, old)
   }
-  for (let index = end + 1; index < views.length; index++) {
-    out[index] = patch(
-      inst,
-      olds[index + olds.length - views.length]!,
-      views[index]!
-    )
+  for (
+    let index = end + 1, shift = olds.length - views.length;
+    index < views.length;
+    index++
+  ) {
+    const old = olds[index + shift]!
+    const view = views[index]!
+    out[index] = old.v === view && kept ? old : patch(inst, old, view)
   }
   if (!moved) {
     for (let index = start, from = start; index <= end + 1; index++) {
@@ -1724,6 +2008,62 @@ const patchList = (
     if (sources![offset] !== 0 && at >= 0 && stay[at] === offset) at--
     else place(host, parent, out[index]!, ref)
     ref = nodeOf(out[index]!)
+  }
+  return out
+}
+
+// Whether the first and last of `olds[start..end]` trade places, with the
+// ones between them where they were: the keyed list diff's most common move,
+// done without a map of the keys.
+const swaps = (
+  olds: Array<Rec>,
+  views: ReadonlyArray<View.Node<any, any>>,
+  start: number,
+  end: number
+): boolean => {
+  const first = keyOf(views[start]!)
+  const last = keyOf(views[end]!)
+  if (
+    first === undefined || last === undefined ||
+    keyOf(olds[start]!.v) !== last || keyOf(olds[end]!.v) !== first ||
+    !pairs(olds[end]!.v, views[start]!) || !pairs(olds[start]!.v, views[end]!)
+  ) return false
+  for (let index = start + 1; index < end; index++) {
+    const prev = olds[index]!.v
+    const view = views[index]!
+    if (prev !== view && !pairs(prev, view)) return false
+  }
+  return true
+}
+
+const patchSwap = (
+  inst: Instance,
+  parent: unknown,
+  olds: Array<Rec>,
+  views: ReadonlyArray<View.Node<any, any>>,
+  out: Array<Rec>,
+  start: number,
+  end: number,
+  after: unknown
+): Array<Rec> => {
+  const host = inst.tree.host
+  const kept = inst.tree.props !== true || host.controlled === undefined
+  out[start] = patch(inst, olds[end]!, views[start]!)
+  for (let index = start + 1; index < views.length; index++) {
+    const old = olds[index === end ? start : index]!
+    const view = views[index]!
+    out[index] = old.v === view && kept ? old : patch(inst, old, view)
+  }
+  // A move takes a node out of the document, so none moves that needn't: of
+  // two neighbours, only one.
+  place(host, parent, out[start]!, nodeOf(out[end]!))
+  if (end > start + 1) {
+    place(
+      host,
+      parent,
+      out[end]!,
+      end + 1 < views.length ? nodeOf(out[end + 1]!) : after
+    )
   }
   return out
 }

@@ -205,7 +205,8 @@ const Main = MainDef.make({
   update,
   view: (h, model) =>
     h.div.class("container").children(
-      jumbotron(h),
+      // Static, so built once and never patched.
+      h.lazy(jumbotron),
       h.table.class("table", "table-hover", "table-striped", "test-data")
         .children(
           h.tbody.children(model.rows.map((item) =>

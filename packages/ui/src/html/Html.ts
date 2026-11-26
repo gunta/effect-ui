@@ -882,6 +882,8 @@ export class VoidElement<
   in out Node = unknown,
   out Tag extends string = string
 > extends View.ElementBuilder<Msg, R, E, Node, Tag> {
+  /** @internal */
+  static override readonly [View.baseFieldsOnly] = true
   /**
    * Phantom: keeps the HTML methods through `View.WithRequirements`.
    *
@@ -1228,6 +1230,8 @@ export class Element<
   in out Node = unknown,
   out Tag extends string = string
 > extends VoidElement<Msg, R, E, Node, Tag> {
+  /** @internal */
+  static override readonly [View.baseFieldsOnly] = true
   /**
    * Phantom: keeps `children` through `View.WithRequirements`.
    *
@@ -2029,6 +2033,8 @@ export class CustomElementBuilder<
   out Tag extends string = string,
   in out Node = ElementOf<Tag>
 > extends Element<Msg, R, Omit<Events, keyof E> & E, Node, Tag> {
+  /** @internal */
+  static override readonly [View.baseFieldsOnly] = true
   /**
    * Phantom: keeps the property methods through `View.WithRequirements`.
    *
@@ -2269,6 +2275,7 @@ export const customElement = <
     ) => [event, Schema.decodeUnknownExit(schema)])
   )
   class Bound extends CustomElementBuilder<any, any, any, any, any, any> {
+    static override readonly [View.baseFieldsOnly] = true
     override on(
       event: string,
       handler: View.Handler<unknown, unknown>,
