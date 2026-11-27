@@ -1,0 +1,16 @@
+{
+  "framework": "vanillajs-keyed",
+  "keyed": true,
+  "benchmark": "22_run-memory",
+  "type": "memory",
+  "values": {
+    "DEFAULT": {
+      "min": 1.8769025802612305,
+      "max": 1.8769025802612305,
+      "median": 1.8769025802612305,
+      "mean": 1.8769025802612305,
+      "stddev": null,
+      "values": [1.8769025802612305]
+    }
+  }
+}

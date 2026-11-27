@@ -1,0 +1,16 @@
+{
+  "framework": "foldkit-v0.171.0-keyed",
+  "keyed": true,
+  "benchmark": "43_first-paint",
+  "type": "size",
+  "values": {
+    "DEFAULT": {
+      "min": 379,
+      "max": 379,
+      "median": 379,
+      "mean": 379,
+      "stddev": null,
+      "values": [379]
+    }
+  }
+}

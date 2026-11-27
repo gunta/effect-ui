@@ -179,7 +179,7 @@ Effect UI has an inspector that you add with one Layer, `DevTools.layer`. It's r
 
 ## Performance
 
-In [js-framework-benchmark](https://github.com/krausest/js-framework-benchmark), Effect UI scored 4.12× vanilla JavaScript across the nine script operations, compared to 6.55× for Foldkit 0.x. It reached first paint in 381 ms instead of 691 ms, and used 4.1 MB of memory with 1,000 rows instead of 6.1 MB. We ran all seven entries on the same machine.
+In [js-framework-benchmark](https://github.com/krausest/js-framework-benchmark), Effect UI scored 1.52× vanilla JavaScript across the nine script operations, the lowest of the six frameworks we ran, compared to 6.69× for Foldkit 0.x. It reached first paint in 243 ms instead of 379 ms, and used 3.0 MB of memory with 1,000 rows instead of 6.1 MB. We ran all seven entries on the same machine.
 
 ::PerformanceChart
 
