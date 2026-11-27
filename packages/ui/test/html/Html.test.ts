@@ -143,12 +143,15 @@ describe("Html", () => {
         "refKey",
         "tag"
       ]
+      // The fields most builders leave unset share one record, `~rare`.
       const builder = [
-        ...node.filter((key) => key !== "attrs"),
         "content",
         "elementAttrs",
-        "hooks",
-        "removals"
+        "elementKey",
+        "handlers",
+        "props",
+        "tag",
+        "~rare"
       ].sort()
       assert.deepStrictEqual(
         Object.keys(h.form.attr("method", "post")).sort(),

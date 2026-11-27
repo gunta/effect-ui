@@ -950,14 +950,34 @@ const makeStep = (
   sends: ReadonlyArray<Send>,
   viewTransitionTypes: ReadonlyArray<string> | undefined
 ): Step<any, any, any, any> =>
-  Object.assign(Object.create(StepProto), {
+  new (StepOf as any)(
     model,
     commands,
     emitted,
     lists,
     sends,
     viewTransitionTypes
-  })
+  )
+
+// A constructor, as one object per step is made, and an object literal
+// assigned onto `Object.create` made two.
+function StepOf(
+  this: any,
+  model: unknown,
+  commands: unknown,
+  emitted: unknown,
+  lists: unknown,
+  sends: unknown,
+  viewTransitionTypes: unknown
+) {
+  this.model = model
+  this.commands = commands
+  this.emitted = emitted
+  this.lists = lists
+  this.sends = sends
+  this.viewTransitionTypes = viewTransitionTypes
+}
+StepOf.prototype = StepProto
 
 const stepWith = (
   step: Step<any, any, any, any>,
@@ -1033,19 +1053,31 @@ const makeUpdate = (
   message: unknown,
   self: Any
 ): Update<any, any, any, any> =>
-  Object.assign(Object.create(UpdateProto), {
-    model,
-    commands: noEffects,
-    emitted: noEffects,
-    lists: noEffects,
-    sends: noEffects,
-    viewTransitionTypes: undefined,
-    props,
-    queries,
-    reads,
-    "~message": message,
-    "~self": self
-  })
+  new (UpdateOf as any)(model, props, queries, reads, message, self)
+
+// A constructor, as `StepOf`: one is made for every message.
+function UpdateOf(
+  this: any,
+  model: unknown,
+  props: unknown,
+  queries: unknown,
+  reads: unknown,
+  message: unknown,
+  self: unknown
+) {
+  this.model = model
+  this.commands = noEffects
+  this.emitted = noEffects
+  this.lists = noEffects
+  this.sends = noEffects
+  this.viewTransitionTypes = undefined
+  this.props = props
+  this.queries = queries
+  this.reads = reads
+  this["~message"] = message
+  this["~self"] = self
+}
+UpdateOf.prototype = UpdateProto
 
 const toUpdateFn = (
   update: AnyUpdate | { readonly [tag: string]: AnyUpdate }

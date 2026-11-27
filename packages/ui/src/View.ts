@@ -206,6 +206,7 @@ export const tokenListAttributes: ReadonlySet<string> = new Set([
 ])
 
 const noOwned: ReadonlyArray<Owned> = []
+
 // What an element built without children holds: one frozen array for all of them.
 const noChildren: ReadonlyArray<never> = Object.freeze([])
 
@@ -217,6 +218,48 @@ const noChildren: ReadonlyArray<never> = Object.freeze([])
  * @internal
  */
 export const noFields: Readonly<Record<string, never>> = Object.freeze({})
+
+/**
+ * The fields of a builder that most never set, in one record that a builder
+ * and its copies share until one is set. A copy, made for every chain call,
+ * then stores six fields fewer.
+ *
+ * @internal
+ */
+export interface Rare {
+  readonly eventOptions: Readonly<Record<string, EventOptions>>
+  readonly refKey: string | undefined
+  readonly mount: Mount<any> | undefined
+  readonly owned: ReadonlyArray<Owned>
+  readonly hooks: ReadonlyArray<Forward> | undefined
+  readonly removals: ReadonlyArray<string> | undefined
+  /**
+   * While a part's forward hook runs, the index of that part's owned layer:
+   * the handlers, ref and mount the hook sets go there.
+   */
+  readonly layer: number | undefined
+}
+
+const noRare: Rare = Object.freeze({
+  eventOptions: noFields,
+  refKey: undefined,
+  mount: undefined,
+  owned: noOwned,
+  hooks: undefined,
+  removals: undefined,
+  layer: undefined
+})
+
+/** Sets one of the `Rare` fields of `builder`, a copy no one else holds yet. */
+const setRare = <K extends keyof Rare>(
+  builder: { readonly "~rare": Rare },
+  name: K,
+  value: Rare[K]
+): void => {
+  const rare: { -readonly [F in keyof Rare]: Rare[F] } = { ...builder["~rare"] }
+  rare[name] = value
+  ;(builder as { "~rare": Rare })["~rare"] = rare
+}
 
 /**
  * An element node, as data.
@@ -254,6 +297,27 @@ export interface Element<out Msg, out R = never> {
   readonly owned?: ReadonlyArray<Owned> | undefined
   readonly children: ReadonlyArray<Node<Msg, R>>
 }
+
+/**
+ * Whether a host makes all of `element` from its tag, attributes, handlers
+ * and children: it sets no property, mount, ref or part layer. With
+ * `isPlainTag`, a copy of another such element's node can stand for its own.
+ *
+ * @internal
+ */
+export const isPlain = (element: Element<any, any>): boolean =>
+  element.props === noFields && element.mount === undefined &&
+  element.refKey === undefined &&
+  (element.owned === undefined || element.owned.length === 0)
+
+/**
+ * Whether an element of `tag` is no more than its markup: not a form, a
+ * script or a custom element, whose node does more than a copy of it shows.
+ *
+ * @internal
+ */
+export const isPlainTag = (tag: string): boolean =>
+  tag !== "form" && tag !== "script" && !tag.includes("-")
 
 /**
  * What `onMount` stores: the issued mount, with its name, its args and the
@@ -653,7 +717,13 @@ export const children = <Msg>(
   for (let i = 0; i < inputs.length; i++) {
     const input = inputs[i]
     if (Array.isArray(input)) {
-      for (let j = 0; j < input.length; j++) pushChild(out, input[j])
+      for (let j = 0; j < input.length; j++) {
+        // An element or a child, as in a list of rows, goes in as it is.
+        const item = input[j]
+        const tag = item?._tag
+        if (tag === "Element" || tag === "Child") out.push(item)
+        else pushChild(out, item)
+      }
     } else {
       pushChild(
         out,
@@ -677,7 +747,10 @@ const pushChild = <Msg>(
     } else out.push(text(input))
     return
   }
-  const node: Node<Msg, any> = toNode(input)
+  // A node, the common input, is taken as it is; anything else is a builder.
+  const node: Node<Msg, any> = (input as Node<Msg, any>)._tag === undefined
+    ? toNode(input)
+    : input as Node<Msg, any>
   if (node._tag === "Text") {
     if (node.text === "") return
     const last = out.length === 0 ? undefined : out[out.length - 1]
@@ -710,7 +783,22 @@ export const isElementBuilder = (
  * @since 0.1.0
  */
 export const toNode = <Msg, R>(content: Content<Msg, R>): Node<Msg, R> =>
-  content instanceof ElementBuilder ? buildWith(content, noChildren) : content
+  content instanceof ElementBuilder ? elementFrom(content) : content
+
+/**
+ * The element a builder describes, with the children it holds: what each
+ * builder a view passes as a child becomes, in one call where there is no
+ * `forward`.
+ */
+const elementFrom = <Msg, R>(
+  builder: ElementBuilder<Msg, any, any, any>
+): Element<Msg, R> => {
+  const hooks = builder["~rare"].hooks
+  const children = builder.content ?? noChildren
+  return hooks === undefined
+    ? elementOf(builder, children)
+    : forwardTo(builder, hooks, children)
+}
 
 /**
  * Builds the element node a builder describes: the children it holds, then
@@ -744,7 +832,7 @@ const buildWith = <Msg, R>(
     : given.length === 0
     ? content
     : children([...content, ...given])
-  const hooks = builder.hooks
+  const hooks = builder["~rare"].hooks
   return hooks === undefined
     ? elementOf(builder, all)
     : forwardTo(builder, hooks, all)
@@ -753,21 +841,64 @@ const buildWith = <Msg, R>(
 const elementOf = <Msg, R>(
   builder: ElementBuilder<Msg, any, any, any>,
   children: ReadonlyArray<Node<Msg, any>>
-): Element<Msg, R> => ({
-  _tag: "Element",
-  tag: builder.tag,
-  elementKey: builder.elementKey,
-  attrs: builder.owned.length === 0
-    ? builder.elementAttrs
-    : withTokens(builder.elementAttrs, builder.owned),
-  props: builder.props,
-  handlers: builder.handlers,
-  eventOptions: builder.eventOptions,
-  refKey: builder.refKey,
-  mount: builder.mount,
-  owned: builder.owned,
-  children
-})
+): Element<Msg, R> => {
+  const rare = builder["~rare"]
+  if (
+    children.length === 0 && rare === noRare && builder.handlers === noFields &&
+    builder.props === noFields && builder.elementKey === undefined &&
+    Object.isFrozen(builder.elementAttrs)
+  ) return leafOf(builder.tag, builder.elementAttrs)
+  return {
+    _tag: "Element",
+    tag: builder.tag,
+    elementKey: builder.elementKey,
+    attrs: rare.owned.length === 0
+      ? builder.elementAttrs
+      : withTokens(builder.elementAttrs, rare.owned),
+    props: builder.props,
+    handlers: builder.handlers,
+    eventOptions: rare.eventOptions,
+    refKey: rare.refKey,
+    mount: rare.mount,
+    owned: rare.owned,
+    children
+  }
+}
+
+const leaves = new WeakMap<object, Map<string, Element<never>>>()
+
+/**
+ * An element with no children and nothing on it but shared attributes, such
+ * as a list's icon or empty cell: one node per tag and attributes, which
+ * every row shares. A patch then finds it the same without reading it.
+ */
+const leafOf = (
+  tag: string,
+  attrs: Readonly<Record<string, string>>
+): Element<any, any> => {
+  let byTag = leaves.get(attrs)
+  if (byTag === undefined) leaves.set(attrs, byTag = new Map())
+  let leaf = byTag.get(tag)
+  if (leaf === undefined) {
+    byTag.set(
+      tag,
+      leaf = {
+        _tag: "Element",
+        tag,
+        elementKey: undefined,
+        attrs,
+        props: noFields,
+        handlers: noFields,
+        eventOptions: noFields,
+        refKey: undefined,
+        mount: undefined,
+        owned: noOwned,
+        children: noChildren
+      }
+    )
+  }
+  return leaf
+}
 
 /**
  * What a builder's `forward` stores: a function from the finished builder
@@ -798,8 +929,9 @@ type OwnFields = Pick<Owned, "handlers" | "eventOptions" | "refKey" | "mount">
 export const ownFields = (
   builder: ElementBuilder<any, any, any, any>
 ): OwnFields => {
-  const index = builder[partForwardLayer]
-  return index === undefined ? builder : builder.owned[index]!
+  const rare = builder["~rare"]
+  const index = rare.layer
+  return index === undefined ? builder : rare.owned[index]!
 }
 
 /**
@@ -811,9 +943,10 @@ export const withOwnFields = <B extends ElementBuilder<any, any, any, any>>(
   builder: B,
   fields: Partial<OwnFields>
 ): B => {
-  const index = builder[partForwardLayer]
+  const rare = builder["~rare"]
+  const index = rare.layer
   if (index === undefined) return withFields(builder, fields)
-  const owned = builder.owned.slice()
+  const owned = rare.owned.slice()
   owned[index] = { ...owned[index]!, ...fields }
   return withFields(builder, { owned })
 }
@@ -831,11 +964,16 @@ const forwardTo = <Msg, R>(
   const finished = copyBuilder(builder) as Mutable<
     ElementBuilder<Msg, any, any, any>
   >
-  finished.hooks = hooks.length === 1 ? undefined : hooks.slice(0, -1)
+  setRare(
+    finished,
+    "hooks",
+    hooks.length === 1 ? undefined : hooks.slice(0, -1)
+  )
   finished.content = content
   finished.elementKey = undefined
   const hook: PartForward = hooks[hooks.length - 1]!
-  finished[partForwardLayer] = hook[partForwardLayer]
+  const layer = hook[partForwardLayer]
+  if (layer !== finished["~rare"].layer) setRare(finished, "layer", layer)
   const out: Node<Msg, R> = toNode(hook(finished))
   if (out._tag !== "Element") {
     throw new Error(
@@ -858,9 +996,15 @@ export const withForward = <B extends ElementBuilder<any, any, any, any>>(
   place: Forward
 ): B => {
   const out = copyBuilder(builder) as Mutable<B>
-  const layer = builder[partForwardLayer]
-  const hook = layer === undefined ? place : forwardInPart(place, layer)
-  out.hooks = builder.hooks === undefined ? [hook] : [...builder.hooks, hook]
+  const rare = builder["~rare"]
+  const hook = rare.layer === undefined
+    ? place
+    : forwardInPart(place, rare.layer)
+  setRare(
+    out,
+    "hooks",
+    rare.hooks === undefined ? [hook] : [...rare.hooks, hook]
+  )
   return out
 }
 
@@ -959,7 +1103,9 @@ const childrenOf = <Msg>(
     ) {
       return children(inputs)
     } else {
-      const node: Node<Msg, any> = toNode(input as Content<Msg, any>)
+      const node: Node<Msg, any> = input instanceof ElementBuilder
+        ? elementFrom(input)
+        : input as Node<Msg, any>
       if (node._tag === "Text") {
         if (node.text === "" || afterText) return children(inputs)
         afterText = true
@@ -1021,7 +1167,27 @@ export const withFields = <B extends ElementBuilder<any, any, any, any>>(
       | "owned"
     >
   >
-): B => Object.assign(copyBuilder(builder), fields)
+): B => {
+  const out = copyBuilder(builder)
+  for (const name in fields) {
+    const value = (fields as Record<string, any>)[name]
+    if (name in noRare) setRare(out, name as keyof Rare, value)
+    else (out as any)[name] = value
+  }
+  return out
+}
+
+/**
+ * Marks a builder class, by a static field of its own, whose builders hold the
+ * base class's fields and no other: its methods add none. Its builders are
+ * copied without counting their fields. A subclass, which may add fields,
+ * isn't marked by its parent's mark.
+ *
+ * @internal
+ */
+export const baseFieldsOnly: unique symbol = Symbol.for(
+  "@effect/ui/View/baseFieldsOnly"
+)
 
 /**
  * A copy of a builder, with its class and every field it holds.
@@ -1029,20 +1195,36 @@ export const withFields = <B extends ElementBuilder<any, any, any, any>>(
  * A view copies a builder for each chain call, so the copy is what building a
  * view costs most. A builder that holds only the base class's fields is
  * copied by a constructor made for its class, which stores them one by one:
- * several times faster than a generic copy. A builder that holds another
- * field under a string key, from its class or added to it, is copied
- * generically. The only field under a symbol, `partForwardLayer`, is copied
- * by name, as asking for a builder's symbols on every copy costs about as
- * much as the rest of building a view.
+ * several times faster than a generic copy. A copy that constructor made, of
+ * a class marked with `baseFieldsOnly` as the library's own are, is taken to
+ * hold only those: the class's methods add none. Any other builder has its
+ * fields counted, in case its class or its caller added one: a builder that
+ * holds another field under a string key is copied generically. A field
+ * under a symbol isn't looked for, as asking for a builder's symbols on
+ * every copy cost about as much as the rest of building a view, so a copy
+ * leaves it behind: a part's forward layer is in `~rare` for that reason.
  */
 const copyBuilder = <B extends ElementBuilder<any, any, any, any>>(
   builder: B
 ): B => {
+  const proto = Object.getPrototypeOf(builder)
+  const made = (builder as any)[copied] === true
+  if (made && proto === lastMarked) return new lastMarkedCopier!(builder) as B
+  if (made && Object.hasOwn(proto.constructor, baseFieldsOnly)) {
+    let copier = copiers.get(proto)
+    if (copier === undefined) {
+      copiers.set(proto, copier = makeCopier(proto, builder))
+    }
+    if (copier !== null) {
+      lastMarked = proto
+      lastMarkedCopier = copier
+      return new copier(builder) as B
+    }
+  }
   // Counted in place: `Object.keys` would make an array for every copy.
   let fields = 0
   for (const _ in builder) fields++
   if (fields === builderFields.length) {
-    const proto = Object.getPrototypeOf(builder)
     let copier = proto === lastProto ? lastCopier : copiers.get(proto)
     if (copier === undefined) {
       copiers.set(proto, copier = makeCopier(proto, builder))
@@ -1051,21 +1233,22 @@ const copyBuilder = <B extends ElementBuilder<any, any, any, any>>(
     lastCopier = copier
     if (copier !== null) return new copier(builder) as B
   }
-  return Object.assign(Object.create(Object.getPrototypeOf(builder)), builder)
+  const out = Object.assign(Object.create(proto), builder)
+  // Not one the copier made, whatever its source was.
+  if (made) out[copied] = false
+  return out
 }
+
+/** Set on the builders a copier makes. Not enumerable by `for...in`, so not counted. */
+const copied: unique symbol = Symbol("@effect/ui/View/copied")
 
 const builderFields = [
   "elementKey",
   "elementAttrs",
   "props",
   "handlers",
-  "eventOptions",
-  "refKey",
-  "mount",
-  "owned",
   "content",
-  "hooks",
-  "removals",
+  "~rare",
   "tag"
 ] as const
 
@@ -1077,6 +1260,8 @@ type Copier = new(
 const copiers = new WeakMap<object, Copier | null>()
 let lastProto: object | undefined
 let lastCopier: Copier | null = null
+let lastMarked: object | undefined
+let lastMarkedCopier: Copier | undefined
 
 /**
  * A constructor that copies the base fields of a builder of the class with
@@ -1098,15 +1283,10 @@ const makeCopier = (
     this.elementAttrs = from.elementAttrs
     this.props = from.props
     this.handlers = from.handlers
-    this.eventOptions = from.eventOptions
-    this.refKey = from.refKey
-    this.mount = from.mount
-    this.owned = from.owned
     this.content = from.content
-    this.hooks = from.hooks
-    this[partForwardLayer] = from[partForwardLayer]
-    this.removals = from.removals
+    this["~rare"] = from["~rare"]
     this.tag = from.tag
+    ;(this as any)[copied] = true
   }
   copier.prototype = proto
   return copier as unknown as Copier
@@ -1241,7 +1421,7 @@ export const makePart = (
   const blank: ElementBuilder<any, any, any, any> = Object.assign(
     Object.create(Object.getPrototypeOf(builder)),
     blankFields,
-    { tag: builder.tag, removals: [] }
+    { "~rare": { ...noRare, removals: [] }, tag: builder.tag }
   )
   const patch = decorate(blank, ...args)
   if (!(patch instanceof ElementBuilder)) {
@@ -1292,9 +1472,11 @@ export const makePart = (
     const hooks = patch.hooks.map((hook) =>
       forwardInPart(hook, builder.owned.length)
     )
-    ;(out as Mutable<typeof out>).hooks = builder.hooks === undefined
-      ? hooks
-      : [...builder.hooks, ...hooks]
+    setRare(
+      out,
+      "hooks",
+      builder.hooks === undefined ? hooks : [...builder.hooks, ...hooks]
+    )
   }
   return out
 }
@@ -1358,6 +1540,56 @@ const firstEntry = <A>(name: string, value: A): Record<string, A> => {
   return out
 }
 
+const classRecords = new Map<string, Readonly<Record<string, string>>>()
+
+/**
+ * The attributes of an element that has only a class: one frozen record per
+ * value, which the rows of a list share. A patch then finds them the same
+ * without reading them, and a render keeps fewer objects. The cache is
+ * emptied when it grows large, as a view may build classes from data.
+ */
+const classOnly = (value: string): Readonly<Record<string, string>> => {
+  let record = classRecords.get(value)
+  if (record === undefined) {
+    if (classRecords.size >= 1024) classRecords.clear()
+    classRecords.set(value, record = Object.freeze({ class: value }))
+  }
+  return record
+}
+
+const extensions = new WeakMap<
+  object,
+  Map<string, Map<string, Readonly<Record<string, string>>>>
+>()
+
+/**
+ * A shared record, as `classOnly` makes, with one more attribute: shared in
+ * turn, so `h.span.class("icon").attr("aria-hidden", "true")` builds one
+ * record for every row. A name given many values, as from data, gets a
+ * record of its own each time past the first few, and so does each name past
+ * the first few, as `data-${id}` would be.
+ */
+const extended = (
+  record: Readonly<Record<string, string>>,
+  name: string,
+  value: string
+): Readonly<Record<string, string>> => {
+  let byName = extensions.get(record)
+  if (byName === undefined) extensions.set(record, byName = new Map())
+  let byValue = byName.get(name)
+  if (byValue === undefined) {
+    if (byName.size >= 32) return assoc(record, name, value)
+    byName.set(name, byValue = new Map())
+  }
+  let out = byValue.get(value)
+  if (out === undefined) {
+    const made = assoc(record, name, value)
+    if (byValue.size >= 32) return made
+    byValue.set(value, out = Object.freeze(made))
+  }
+  return out
+}
+
 /** Sets an own entry, `__proto__` included, which a plain store would take as the prototype. */
 const put = <A>(record: Record<string, A>, name: string, value: A): void => {
   if (name === "__proto__") {
@@ -1379,14 +1611,7 @@ const blankFields = {
   elementAttrs: noFields,
   props: noFields,
   handlers: noFields,
-  eventOptions: noFields,
-  refKey: undefined,
-  mount: undefined,
-  owned: noOwned,
-  content: undefined,
-  hooks: undefined,
-  [partForwardLayer]: undefined,
-  removals: undefined
+  content: undefined
 }
 
 let lastPath = ""
@@ -1448,6 +1673,8 @@ export class ElementBuilder<
   in out HostNode = unknown,
   out Tag extends string = string
 > {
+  /** @internal */
+  static readonly [baseFieldsOnly] = true
   /**
    * The key set with `key`, if any.
    *
@@ -1477,25 +1704,49 @@ export class ElementBuilder<
    *
    * @since 0.1.0
    */
-  readonly eventOptions: Readonly<Record<string, EventOptions>> = noFields
+  get eventOptions(): Readonly<Record<string, EventOptions>> {
+    return this["~rare"].eventOptions
+  }
+  /** @internal */
+  protected set eventOptions(value: Readonly<Record<string, EventOptions>>) {
+    setRare(this, "eventOptions", value)
+  }
   /**
    * The ref set with `ref`, if any.
    *
    * @since 0.1.0
    */
-  readonly refKey: string | undefined = undefined
+  get refKey(): string | undefined {
+    return this["~rare"].refKey
+  }
+  /** @internal */
+  protected set refKey(value: string | undefined) {
+    setRare(this, "refKey", value)
+  }
   /**
    * The work set with `onMount`, if any.
    *
    * @since 0.1.0
    */
-  readonly mount: Mount<Msg> | undefined = undefined
+  get mount(): Mount<Msg> | undefined {
+    return this["~rare"].mount as Mount<Msg> | undefined
+  }
+  /** @internal */
+  protected set mount(value: Mount<Msg> | undefined) {
+    setRare(this, "mount", value)
+  }
   /**
    * The layers added by the parts of headless components.
    *
    * @since 0.1.0
    */
-  readonly owned: ReadonlyArray<Owned> = noOwned
+  get owned(): ReadonlyArray<Owned> {
+    return this["~rare"].owned
+  }
+  /** @internal */
+  protected set owned(value: ReadonlyArray<Owned>) {
+    setRare(this, "owned", value)
+  }
   /**
    * The children given with `children` so far, as nodes, or `undefined`
    * before the first call. Read the element's children off the node,
@@ -1509,20 +1760,33 @@ export class ElementBuilder<
    *
    * @since 0.1.0
    */
-  readonly hooks: ReadonlyArray<Forward> | undefined = undefined
-  /**
-   * While a part's forward hook runs, the index of that part's owned layer.
-   *
-   * @internal
-   */
-  readonly [partForwardLayer]: number | undefined = undefined
+  get hooks(): ReadonlyArray<Forward> | undefined {
+    return this["~rare"].hooks
+  }
+  /** @internal */
+  protected set hooks(value: ReadonlyArray<Forward> | undefined) {
+    setRare(this, "hooks", value)
+  }
   /**
    * On the blank builder a part decorates, the attributes the part
    * removed. `undefined` on every other builder.
    *
    * @since 0.1.0
    */
-  readonly removals: ReadonlyArray<string> | undefined = undefined
+  get removals(): ReadonlyArray<string> | undefined {
+    return this["~rare"].removals
+  }
+  /** @internal */
+  protected set removals(value: ReadonlyArray<string> | undefined) {
+    setRare(this, "removals", value)
+  }
+  /**
+   * The options, ref, mount, layers, `forward` functions and removals, which
+   * most builders leave unset, in one record their copies share.
+   *
+   * @internal
+   */
+  readonly "~rare": Rare = noRare
   /**
    * Phantom: the requirements of the element's mount, which surface in the
    * component's.
@@ -1601,10 +1865,18 @@ export class ElementBuilder<
     } else if (options !== undefined || Object.hasOwn(eventOptions, event)) {
       eventOptions = withEntry(eventOptions, event, options)
     }
-    return withOwnFields(this, {
-      handlers: assoc(own.handlers, event, handler),
-      eventOptions
-    })
+    const handlers = assoc(own.handlers, event, handler)
+    if (this["~rare"].layer !== undefined) {
+      return withOwnFields(this, { handlers, eventOptions })
+    }
+    // Outside a part's forward hook, the usual case: `~rare` is copied only
+    // when the event options change.
+    const out = copyBuilder(this) as Mutable<this>
+    out.handlers = handlers
+    if (eventOptions !== own.eventOptions) {
+      setRare(out, "eventOptions", eventOptions)
+    }
+    return out
   }
   /**
    * Keeps this element's node when its siblings move. Unique among siblings.
@@ -1633,13 +1905,20 @@ export class ElementBuilder<
     ) return this
     const out = copyBuilder(this) as Mutable<this>
     if (value === undefined && removals !== undefined) {
-      out.removals = [...removals, name]
+      setRare(out, "removals", [...removals, name])
     }
     if (attrs === noFields) {
-      if (value !== undefined) out.elementAttrs = assoc(attrs, name, value)
+      if (value !== undefined) {
+        out.elementAttrs = name === "class"
+          ? classOnly(value)
+          : assoc(attrs, name, value)
+      }
       // Removing an attribute that isn't set leaves the record as it is.
     } else if (value !== undefined || Object.hasOwn(attrs, name)) {
-      out.elementAttrs = withEntry(attrs, name, value)
+      out.elementAttrs = value !== undefined && Object.isFrozen(attrs) &&
+          !Object.hasOwn(attrs, name)
+        ? extended(attrs, name, value)
+        : withEntry(attrs, name, value)
     }
     return out
   }
@@ -1680,7 +1959,7 @@ export class ElementBuilder<
         put(next, name, value)
       }
     }
-    if (removals !== undefined) out.removals = removals
+    if (removals !== undefined) setRare(out, "removals", removals)
     if (next !== undefined) out.elementAttrs = next
     return out
   }
@@ -1874,6 +2153,8 @@ export class ContainerBuilder<
   in out HostNode = unknown,
   out Tag extends string = string
 > extends ElementBuilder<Msg, R, Handlers, HostNode, Tag> {
+  /** @internal */
+  static override readonly [baseFieldsOnly] = true
   /**
    * Phantom: keeps `ContainerBuilder` through `WithRequirements`.
    *
@@ -1962,7 +2243,24 @@ export const shorthand = <
   const root = (...inputs: ReadonlyArray<Input<any, any>>) =>
     (root as any).children(...inputs)
   Object.setPrototypeOf(root, Object.getPrototypeOf(builder))
-  return Object.assign(root, builder) as any
+  Object.assign(root, builder)
+  return markRoot(root as any)
+}
+
+/**
+ * Marks a vocabulary's root builder, which every render shares and nothing
+ * gives another field, to be copied as a copier's builders are when it holds
+ * the base fields only. A `shorthand` root is marked already. Returns it.
+ *
+ * @internal
+ */
+export const markRoot = <B extends ElementBuilder<any, any, any, any>>(
+  builder: B
+): B => {
+  let fields = 0
+  for (const _ in builder) fields++
+  if (fields === builderFields.length) (builder as any)[copied] = true
+  return builder
 }
 
 /**
@@ -2214,23 +2512,32 @@ export class Lazies {
     this.round++
     this.used = 0
   }
-  /** Drops the entries this render didn't use, such as a removed row's. */
+  /**
+   * Drops the entries renders haven't used, such as a removed row's, once
+   * they are as many as the ones this render used. Looking for them reads
+   * every entry, so a render that rebuilds a few rows doesn't: what a render
+   * costs follows what it changed, and the entries kept are at most twice
+   * the ones in use.
+   */
   end(): void {
     const entries = this.entries
     const round = this.round
-    if (this.used === entries.size) return
+    if (entries.size - this.used < this.used || this.used === entries.size) {
+      return
+    }
+    // `forEach`, as iterating with `for...of` makes an array for every entry.
     // When most go, the rest move to a new Map: a Map keeps its size after deletes.
     if (this.used * 4 <= entries.size) {
       const kept = new Map<unknown, LazyEntry>()
-      for (const [key, entry] of entries) {
+      entries.forEach((entry, key) => {
         if (entry.round === round) kept.set(key, entry)
-      }
+      })
       this.entries = kept
       return
     }
-    for (const [key, entry] of entries) {
+    entries.forEach((entry, key) => {
       if (entry.round !== round) entries.delete(key)
-    }
+    })
   }
 }
 
@@ -2306,7 +2613,15 @@ class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
     const key = args.length === 0 ? fn : args[0]
     const entry = lazies.entries.get(key)
     const round = lazies.round
-    if (entry !== undefined && entry.fn === fn && sameArgs(entry.args, args)) {
+    // Up to two arguments, the common case, compared in place: a view calls
+    // this for every row it shows.
+    const was = entry?.args
+    if (
+      entry !== undefined && entry.fn === fn && was!.length === args.length &&
+      (args.length > 2
+        ? sameArgs(was!, args)
+        : was![0] === args[0] && was![1] === args[1])
+    ) {
       if (entry.round !== round) {
         entry.round = round
         lazies.used++

@@ -111,6 +111,14 @@ packages/ui/benchmark/js-framework-benchmark/run.sh ../js-framework-benchmark
 
 The argument is where the harness is cloned, outside this repository. `run.sh` clones the harness at the pinned revision with only the seven entries, installs it, builds and packs `@effect/ui`, builds every entry, starts the harness's server on port 8080, checks that every entry is keyed and runs the benchmarks one framework at a time. A run takes about an hour. `REVERSE=1` runs the frameworks in reverse order, as the second run did. Arguments after the directory go to the harness, for example `--count 3 --benchmark 01_ 07_` for a quick check.
 
+For a quicker comparison while working on a change, `quick.mjs` runs the CPU benchmarks in the harness's protocol against the harness's server, set up as above: a fresh page per sample, the harness's warm-up steps and CPU slowdowns, and the script time read from a trace of the measured click. The entries alternate sample by sample, so a change can be compared with the commit before it, or with another framework, in a few minutes:
+
+```sh
+node packages/ui/benchmark/js-framework-benchmark/quick.mjs --samples 11 solid effect-ui effect-ui:index-before.html
+```
+
+`effect-ui:index-before.html` is a copy of the entry's `index.html` that loads another build of it. Its figures are close to the harness's but not the same, so report the harness's.
+
 To summarize one or more runs:
 
 ```sh
@@ -123,5 +131,6 @@ node packages/ui/benchmark/js-framework-benchmark/summarize.mjs <results dir>...
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `effect-ui/`                     | the harness entry for Effect UI                                                                                                  |
 | `run.sh`                         | sets up the harness and runs it                                                                                                  |
+| `quick.mjs`                      | compares entries on the CPU benchmarks in the harness's protocol, in minutes                                                     |
 | `summarize.mjs`                  | turns the harness's result files into the tables above                                                                           |
 | `results/pass1`, `results/pass2` | the harness's raw result files from the two runs, with every iteration's value, and the load average when each framework started |

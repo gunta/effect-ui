@@ -930,6 +930,11 @@ export const makeHost = (
     },
     parentOf: (node) => node.parentNode!,
     nextOf: (node) => node.nextSibling,
+    clone: (node) => node.cloneNode(true),
+    firstOf: (node) => node.firstChild,
+    kindOf: (node) =>
+      node.nodeType === 3 ? "#text" : (node as globalThis.Element).localName,
+    recOf: (node) => (node as Node).$r,
     createContainer: () => document.createDocumentFragment(),
     controlled,
     runsMounts: true,
