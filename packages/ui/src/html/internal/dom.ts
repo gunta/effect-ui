@@ -933,6 +933,7 @@ export const makeHost = (
     clone: (node) => node.cloneNode(true),
     firstOf: (node) => node.firstChild,
     isText: (node) => node.nodeType === 3,
+    tagOf: (node) => (node as globalThis.Element).localName,
     recOf: (node) => (node as Node).$r,
     createContainer: () => document.createDocumentFragment(),
     controlled,

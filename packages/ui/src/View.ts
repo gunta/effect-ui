@@ -1545,7 +1545,8 @@ const extensions = new WeakMap<
  * A shared record, as `classOnly` makes, with one more attribute: shared in
  * turn, so `h.span.class("icon").attr("aria-hidden", "true")` builds one
  * record for every row. A name given many values, as from data, gets a
- * record of its own each time past the first few.
+ * record of its own each time past the first few, and so does each name past
+ * the first few, as `data-${id}` would be.
  */
 const extended = (
   record: Readonly<Record<string, string>>,
@@ -1555,7 +1556,10 @@ const extended = (
   let byName = extensions.get(record)
   if (byName === undefined) extensions.set(record, byName = new Map())
   let byValue = byName.get(name)
-  if (byValue === undefined) byName.set(name, byValue = new Map())
+  if (byValue === undefined) {
+    if (byName.size >= 32) return assoc(record, name, value)
+    byName.set(name, byValue = new Map())
+  }
   let out = byValue.get(value)
   if (out === undefined) {
     const made = assoc(record, name, value)

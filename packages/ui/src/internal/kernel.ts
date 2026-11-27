@@ -62,6 +62,8 @@ export interface Host<N = any> {
   readonly firstOf?: ((node: N) => N | null) | undefined
   /** With `clone`: whether a node is text, and the record `setEvents` gave it first. */
   readonly isText?: ((node: N) => boolean) | undefined
+  /** With `clone`: an element node's tag, as a view names it. */
+  readonly tagOf?: ((node: N) => string) | undefined
   readonly recOf?: ((node: N) => Rec | undefined) | undefined
   readonly commit?: (() => void) | undefined
   readonly unmounting?:
@@ -1443,9 +1445,13 @@ export const kidsOf = (
   let child = host.firstOf!(rec.node)
   for (let index = 0; index < views.length; index++) {
     const view = views[index]!
-    if (child === null || host.isText!(child) !== (view._tag === "Text")) {
-      return rebuild(rec, prev)
-    }
+    // A node that isn't the kind, or the tag, the view made: something
+    // replaced it, and its record would patch the wrong element.
+    if (
+      child === null || host.isText!(child) !== (view._tag === "Text") ||
+      (view._tag === "Element" && host.tagOf !== undefined &&
+        host.tagOf(child) !== view.tag)
+    ) return rebuild(rec, prev)
     if (view._tag === "Text") {
       made[index] = new Rec(view, child, undefined, rec.inst)
     } else {

@@ -226,6 +226,28 @@ describe("rows built from a copy", { concurrent: false }, () => {
         assert.deepStrictEqual(root.model()!.clicks, [3])
       }).pipe(Effect.scoped))
 
+    it.effect(`${variant}: a row whose element something else replaced is built again`, () =>
+      Effect.gen(function*() {
+        const app = yield* container
+        const root = yield* BrowserHost.mountEffect(Table, {}, app)
+        root.send(Message.Set({ rows: rowsOf(1, 3) }))
+        yield* tick
+        // The label's link swapped for a span with the same text.
+        const link = labelOf(app, 2)
+        const span = document.createElement("span")
+        span.textContent = link.textContent
+        link.replaceWith(span)
+        root.send(Message.Label({ id: 3, label: "patched" }))
+        yield* tick
+        assert.strictEqual(
+          app.querySelector("tbody")!.innerHTML,
+          expected(root.model()!)
+        )
+        labelOf(app, 2).click()
+        yield* tick
+        assert.deepStrictEqual(root.model()!.clicks, [3])
+      }).pipe(Effect.scoped))
+
     it.effect(`${variant}: a row rebuilt in the render that changes it shows the change`, () =>
       Effect.gen(function*() {
         const app = yield* container
