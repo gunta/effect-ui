@@ -379,13 +379,14 @@ export const makeHost = (
     restore.add(target)
   }
 
+  // The deepest a template's element with handlers is below its root, of
+  // the templates this host rendered: -1 until it renders one. A node with
+  // handlers in a template is at most that far below its row, so `rowOf`
+  // walks no further, and not at all in a page without templates.
+  let templateDepth = -1
+
   // The element a template made that `node` is in, by its marked root, if
   // `node` is one of its own nodes: one without a record.
-  // The deepest a template's element with handlers is below its root, of
-  // the templates this host rendered: -1 until it renders one.
-  let templateDepth = -1
-  // A node with handlers in a template is at most that far below its row,
-  // so the walk is that long, and none at all in a page without templates.
   const rowOf = (node: globalThis.Node): Kernel.Rec | undefined => {
     let at: Node | null = node as Node
     for (let up = 0; up <= templateDepth; up++) {
@@ -397,12 +398,12 @@ export const makeHost = (
     return undefined
   }
 
-  // The row `recOf` found its record in, if it was a template's.
+  // The row `targetOf` found its target in, if it was a template's.
   let foundRow: Kernel.Rec | undefined
 
   // What `node` dispatches through: its record, or for an element of a
-  // template, the template's target for it, read off the template's points.
-  const recOf = (node: globalThis.Node): Kernel.Rec | undefined => {
+  // template, the template's target for it, read off the row's points.
+  const targetOf = (node: globalThis.Node): Kernel.Rec | undefined => {
     foundRow = undefined
     const rec = (node as Node).$r
     if (rec !== undefined || templateDepth < 0) return rec
@@ -425,21 +426,28 @@ export const makeHost = (
   }
 
   const elementOf = (node: globalThis.Node) =>
-    recOf(node)?.v as View.Element<any, any> | undefined
+    targetOf(node)?.v as View.Element<any, any> | undefined
 
-  // The handler `node` has for `name`: its element's, or for an element of a
-  // template whose handler is a slot, the row's value for the slot, which
-  // may be none.
-  const handlerOf = (node: globalThis.Node, name: string): unknown => {
-    const rec = recOf(node)
+  // The handler for `name` of `rec`, a target `targetOf` found in `row`: its
+  // element's, or for an element of a template whose handler is a slot, the
+  // row's value for the slot. Only `undefined` is no handler: `null` and
+  // `false` are messages, as they are to `on`.
+  const handlerIn = (
+    rec: Kernel.Rec | undefined,
+    row: Kernel.Rec | undefined,
+    name: string
+  ): View.Handler<any, any> | undefined => {
     const handler = (rec?.v as View.Element<any, any> | undefined)
       ?.handlers[name]
-    if (handler === undefined || foundRow === undefined) return handler
+    if (handler === undefined || row === undefined) return handler
     const slot = (rec as unknown as View.TemplateTarget).slots[name]
     return slot === undefined
       ? handler
-      : (foundRow.v as View.TemplateNode).values?.[slot]
+      : (row.v as View.TemplateNode).values[slot] as View.Handler<any, any>
   }
+
+  const handlerOf = (node: globalThis.Node, name: string) =>
+    handlerIn(targetOf(node), foundRow, name)
 
   /** Applies a sending handler's options to its event. */
   const sent = (
@@ -464,24 +472,13 @@ export const makeHost = (
     payload: () => unknown,
     event?: Event
   ): boolean => {
-    const rec = recOf(node)
+    const rec = targetOf(node)
     const row = foundRow
-    const element = rec?.v as View.Element<any, any> | undefined
-    let handler = element?.handlers[name]
+    const handler = handlerIn(rec, row, name)
     if (handler === undefined) return false
-    let inst = rec!.inst
-    if (row !== undefined) {
-      // An element of a template: a slot's handler is the row's value for it.
-      inst = row.inst
-      const slot = (rec as unknown as View.TemplateTarget).slots[name]
-      if (slot !== undefined) {
-        // Only `undefined` is no handler: `null` and `false` are messages,
-        // as they are to `on`.
-        handler = (row.v as View.TemplateNode).values?.[slot]
-        if (handler === undefined) return false
-      }
-    }
-    const options = element!.eventOptions[name]
+    // A template's target sends to the row's instance.
+    const inst = (row ?? rec!).inst
+    const options = (rec!.v as View.Element<any, any>).eventOptions[name]
     if (options?.preventDefault === "always") event?.preventDefault()
     step(() => {
       if (inst.closed) return false
@@ -559,11 +556,14 @@ export const makeHost = (
   }
 
   const accepts = (node: globalThis.Node, types: ReadonlyArray<string>) => {
-    if (handlerOf(node, "drop") === undefined) return false
-    return (elementOf(node)!.eventOptions.drop as
+    const rec = targetOf(node)
+    if (handlerIn(rec, foundRow, "drop") === undefined) return false
+    const options = (rec!.v as View.Element<any, any>).eventOptions.drop as
       | Html.DropTargetOptions
-      | undefined)?.accepts
-      ?.some((type) => types.includes(type.toLowerCase())) === true
+      | undefined
+    return options?.accepts?.some((type) =>
+      types.includes(type.toLowerCase())
+    ) === true
   }
 
   const dropTargetOf = (event: DragEvent, path: ReadonlyArray<Node>) => {

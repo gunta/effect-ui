@@ -1341,13 +1341,16 @@ export const classNames = (...tokens: ReadonlyArray<ClassToken>): string =>
 // The last tokens joined after each first token, and what they made: a view
 // gives the same class list on every render, and joining it again would make
 // a new string, which the attribute record shared per class then hashes.
-const joins = new Map<
-  ClassToken,
-  { readonly tokens: ReadonlyArray<ClassToken>; readonly value: string }
->()
+interface Joined {
+  tokens: ReadonlyArray<ClassToken>
+  value: string
+}
+
+const joins = new Map<ClassToken, Joined>()
 
 const joinClassTokens = (tokens: ReadonlyArray<ClassToken>): string => {
-  const last = joins.get(tokens[0])
+  const first = tokens[0]
+  const last = joins.get(first)
   if (last !== undefined && last.tokens.length === tokens.length) {
     let same = true
     for (let i = 1; same && i < tokens.length; i++) {
@@ -1360,8 +1363,14 @@ const joinClassTokens = (tokens: ReadonlyArray<ClassToken>): string => {
     const token = tokens[i]
     if (token) out = out === "" ? token : out + " " + token
   }
-  if (joins.size >= 512) joins.clear()
-  joins.set(tokens[0], { tokens, value: out })
+  // A first token seen before keeps its entry, written over.
+  if (last !== undefined) {
+    last.tokens = tokens
+    last.value = out
+  } else {
+    if (joins.size >= 512) joins.clear()
+    joins.set(first, { tokens, value: out })
+  }
   return out
 }
 

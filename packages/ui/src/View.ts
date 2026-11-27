@@ -2642,7 +2642,7 @@ export interface ListHint {
    * with the one at `start`, nothing else changed: `removed` and `added`
    * are 0 then.
    */
-  readonly traded?: number | undefined
+  readonly traded: number | undefined
 }
 
 const hints = new WeakMap<ReadonlyArray<unknown>, ListHint>()
@@ -3011,8 +3011,8 @@ class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
         }
         const changed: Array<number> = []
         if (at.size === items.length) {
-          for (const key of [state.selected, selected]) {
-            const index = key === undefined ? undefined : at.get(key)
+          for (const named of [state.selected, selected]) {
+            const index = named === undefined ? undefined : at.get(named)
             if (index !== undefined) {
               nodes[index] = build(items[index])
               changed.push(index)
@@ -3049,20 +3049,22 @@ class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
         }
       }
     }
-    const next: ListState = state ?? {
-      items,
-      selected,
-      nodes,
-      at: undefined,
-      round: lazies.round
+    if (state === undefined) {
+      ;(lazies.lists ??= new Map()).set(render, {
+        items,
+        selected,
+        nodes,
+        at,
+        round: lazies.round
+      })
+    } else {
+      state.items = items
+      state.selected = selected
+      state.nodes = nodes
+      state.at = at
+      state.round = lazies.round
     }
-    next.items = items
-    next.selected = selected
-    next.nodes = nodes
-    next.at = at
-    next.round = lazies.round
     lazies.listsUsed++
-    if (state === undefined) (lazies.lists ??= new Map()).set(render, next)
     lists.add(nodes)
     return nodes
   }
@@ -3355,8 +3357,8 @@ export interface TemplateHole {
    * written as a `"text"` slot's is, or an array of nodes, which the element
    * holds instead.
    */
-  readonly kind: "text" | "attr" | "handler" | "content"
-  /** The attribute's or the event's name. */
+  readonly kind: "text" | "attr" | "content"
+  /** The attribute's name. */
   readonly name: string
   readonly slot: string
   /** A content slot's element, as the number of its node. */
@@ -3380,13 +3382,13 @@ export interface TemplateTarget {
   readonly eventOptions: Readonly<Record<string, EventOptions>>
   /** The slot of each event whose handler is one. */
   readonly slots: Readonly<Record<string, string>>
-  readonly "~target": true
 }
 
 /**
  * What `template` makes once: the element with placeholders, the paths to the
- * nodes the slots write, its holes, and the element the host builds its
- * nodes from.
+ * nodes the slots write, its slots by kind, and the element the host builds
+ * its nodes from. A handler's slot is read off the values when its event
+ * comes, so it has no hole.
  *
  * @internal
  */
@@ -3403,13 +3405,10 @@ export interface TemplateDef {
     readonly from: ReadonlyArray<number>
     readonly next: ReadonlyArray<number>
   }
-  readonly holes: ReadonlyArray<TemplateHole>
-  /** The text slots, the attribute slots and the content slots, apart: what a render writes. */
+  /** The text slots, the attribute slots and the content slots: what a render writes. */
   readonly texts: ReadonlyArray<TemplateHole>
   readonly attrs: ReadonlyArray<TemplateHole>
   readonly contents: ReadonlyArray<TemplateHole>
-  /** The slots a patch writes: all but the handlers, read when their events come. */
-  readonly writes: ReadonlyArray<TemplateHole>
   /** Whether the root has children, which its record makes when patched. */
   readonly parent: boolean
   /** How far below the root its deepest element with handlers is. */
@@ -3417,8 +3416,6 @@ export interface TemplateDef {
   /** For each point that is an element with handlers, its static handlers and options. */
   readonly handled: ReadonlyArray<
     {
-      /** The child indexes from the root to the element. */
-      readonly path: ReadonlyArray<number>
       /**
        * The number of the element's node, as a hole's `point`: a host finds
        * which element an event came from by the node, not by where it is, as
@@ -3446,6 +3443,7 @@ const defineTemplate = (
   const handled: Array<TemplateDef["handled"][number]> = []
   let keySlot: string | undefined
   let contents = 0
+  let depth = 0
   const pointOf = (path: ReadonlyArray<number>): number => {
     const last = points[points.length - 1]
     if (last !== undefined && last.join() === path.join()) {
@@ -3483,11 +3481,7 @@ const defineTemplate = (
         `View.template: a template holds elements and text, not a ${node._tag}`
       )
     }
-    if (
-      node.props !== noFields || node.mount !== undefined ||
-      node.refKey !== undefined || (node.owned?.length ?? 0) > 0 ||
-      node.tag === "form" || node.tag === "script" || node.tag.includes("-")
-    ) {
+    if (!isPlain(node) || !isPlainTag(node.tag)) {
       throw new Error(
         `View.template: <${node.tag}> holds properties, a mount, a ref or a part, or is a form, a script or a custom element; put it in the view around the template`
       )
@@ -3527,31 +3521,19 @@ const defineTemplate = (
         else {
           handlers[name] = slot
           slots[name] = slot
-          // A handler is read off the values when its event comes: no node.
-          holes.push({
-            point: -1,
-            kind: "handler",
-            name,
-            slot,
-            owner: -1,
-            index: -1
-          })
         }
       }
       const target: Mutable<TemplateTarget> = {
         v: undefined!,
         handlers,
         eventOptions: node.eventOptions,
-        slots,
-        "~target": true
+        slots
       }
       target.v = target
-      handled.push({ path, point: pointOf(path), target })
+      handled.push({ point: pointOf(path), target })
+      if (path.length > depth) depth = path.length
     }
-    // A slot that is the element's only child is its content: text, or the
-    // nodes of an array, such as a list `h.list` gave.
-    const only = node.children.length === 1 ? node.children[0]! : undefined
-    const content = only?._tag === "Text" ? slotOf(only.text) : undefined
+    const content = contentSlotOf(node)
     let children: ReadonlyArray<Node<any, any>>
     if (content !== undefined) {
       const owner = pointOf(path)
@@ -3617,27 +3599,20 @@ const defineTemplate = (
     }
     at.push(trail[path.length]!)
   })
-  const placed = holes.map((hole) =>
-    hole.point < 0 ? hole : {
-      ...hole,
-      point: at[hole.point]!,
-      owner: hole.owner < 0 ? -1 : at[hole.owner]!
-    }
-  )
+  const placed = holes.map((hole) => ({
+    ...hole,
+    point: at[hole.point]!,
+    owner: hole.owner < 0 ? -1 : at[hole.owner]!
+  }))
   return {
     root,
     keySlot,
     walk: { from, next },
-    holes: placed,
     texts: placed.filter((hole) => hole.kind === "text"),
     attrs: placed.filter((hole) => hole.kind === "attr"),
     contents: placed.filter((hole) => hole.kind === "content"),
-    writes: placed.filter((hole) => hole.kind !== "handler"),
     parent: root.children.length > 0,
-    depth: handled.reduce(
-      (deepest, entry) => Math.max(deepest, entry.path.length),
-      0
-    ),
+    depth,
     handled: handled.map((entry) => ({ ...entry, point: at[entry.point]! })),
     blank,
     kernel
@@ -3704,11 +3679,39 @@ export class TemplateNode implements Element<any, never> {
   }
 }
 
-const valueOf = (values: Readonly<Record<string, unknown>>, slot: string) => {
-  const value = values[slot]
-  return value === undefined || value === null || value === false
-    ? undefined
-    : value
+/**
+ * A slot's value as given: `undefined`, `null` and `false` leave it out, so
+ * an attribute slot holding one has no attribute, and a text slot is empty.
+ *
+ * @internal
+ */
+export const slotValue = (value: unknown): unknown =>
+  value === undefined || value === null || value === false ? undefined : value
+
+/**
+ * The text a text or content slot holding `value`, not an array, shows.
+ *
+ * @internal
+ */
+export const slotText = (value: unknown): string =>
+  typeof value === "string" ? value : String(slotValue(value) ?? "")
+
+/**
+ * The nodes a content slot holding an array shows: a list `h.list` gave as
+ * it is, which keeps what it says about how it changed, and any other array
+ * as `children` takes it.
+ *
+ * @internal
+ */
+export const nodesIn = (
+  value: ReadonlyArray<unknown>
+): ReadonlyArray<Node<any, any>> =>
+  isList(value) ? value : children(value as never)
+
+// The slot of a template's element whose only child is a slot: its content.
+const contentSlotOf = (node: Element<any, any>): string | undefined => {
+  const only = node.children.length === 1 ? node.children[0]! : undefined
+  return only?._tag === "Text" ? slotOf(only.text) : undefined
 }
 
 const fillSlots = (
@@ -3720,9 +3723,7 @@ const fillSlots = (
   const node = asElement(view)
   if (node._tag === "Text") {
     const slot = slotOf(node.text)
-    return slot === undefined
-      ? node
-      : text(String(valueOf(values, slot) ?? ""))
+    return slot === undefined ? node : text(slotText(values[slot]))
   }
   if (node._tag !== "Element") return node
   let attrs: Record<string, string> | undefined
@@ -3730,7 +3731,7 @@ const fillSlots = (
     const slot = slotOf(node.attrs[name])
     if (slot === undefined) continue
     attrs ??= { ...node.attrs }
-    const value = valueOf(values, slot)
+    const value = slotValue(values[slot])
     if (value === undefined) delete attrs[name]
     else attrs[name] = String(value)
   }
@@ -3744,10 +3745,8 @@ const fillSlots = (
     else handlers[name] = value as Handler<any, any>
   }
   const key = slotOf(node.elementKey)
-  // A content slot holding an array: its nodes are the children, a list
-  // `h.list` gave as it is.
-  const only = node.children.length === 1 ? node.children[0]! : undefined
-  const content = only?._tag === "Text" ? slotOf(only.text) : undefined
+  // A content slot holding an array: its nodes are the children.
+  const content = contentSlotOf(node)
   const nodes = content === undefined ? undefined : values[content]
   return {
     ...node,
@@ -3757,7 +3756,7 @@ const fillSlots = (
     attrs: attrs ?? node.attrs,
     handlers: handlers ?? node.handlers,
     children: Array.isArray(nodes)
-      ? isList(nodes) ? nodes : children(nodes)
+      ? nodesIn(nodes)
       : node.children.map((child) => fillSlots(child, values))
   }
 }

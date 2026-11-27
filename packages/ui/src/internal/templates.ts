@@ -6,44 +6,33 @@
  *
  * @internal
  */
-import { checkKeys, dev } from "#dev"
 import * as View from "../View.ts"
 import {
   create,
-  createAll,
   type Host,
   type Instance,
   patchKids,
   Rec,
+  restore,
   unmade
 } from "./kernel.ts"
 
-// What a slot holds once given: `undefined`, `null` and `false` leave it out.
-const slotValue = (
-  values: Readonly<Record<string, unknown>>,
-  slot: string
-): unknown => {
-  const value = values[slot]
-  return value === null || value === false ? undefined : value
-}
-
-const writeHole = (
+// Writes an attribute slot that held `was` and now holds `value`.
+const writeAttr = (
   host: Host,
   hole: View.TemplateHole,
   node: unknown,
   value: unknown,
   was: unknown
 ): void => {
-  if (hole.kind === "text") {
-    host.setText(node, value === undefined ? "" : String(value))
-  } else {
-    host.setAttr(
-      node,
-      hole.name,
-      value === undefined ? undefined : String(value),
-      was === undefined ? undefined : String(was)
-    )
-  }
+  const to = View.slotValue(value)
+  const from = View.slotValue(was)
+  host.setAttr(
+    node,
+    hole.name,
+    to === undefined ? undefined : String(to),
+    from === undefined ? undefined : String(from)
+  )
 }
 
 // A template's element, built from a copy of the nodes the host built for
@@ -67,23 +56,15 @@ const createTemplate = (inst: Instance, view: View.TemplateNode): Rec => {
   const texts = def.texts
   for (let index = 0; index < texts.length; index++) {
     const hole = texts[index]!
-    const value = values[hole.slot]
-    host.setText(
-      points[hole.point],
-      value === undefined || value === null || value === false
-        ? ""
-        : typeof value === "string"
-        ? value
-        : String(value)
-    )
+    host.setText(points[hole.point], View.slotText(values[hole.slot]))
   }
   // And nothing in an attribute slot.
   const attrs = def.attrs
   for (let index = 0; index < attrs.length; index++) {
     const hole = attrs[index]!
-    const value = slotValue(values, hole.slot)
+    const value = View.slotValue(values[hole.slot])
     if (value !== undefined) {
-      writeHole(host, hole, points[hole.point], value, undefined)
+      host.setAttr(points[hole.point], hole.name, String(value), undefined)
     }
   }
   // The host finds an element's handlers from the marked root, so only the
@@ -106,8 +87,8 @@ const createTemplate = (inst: Instance, view: View.TemplateNode): Rec => {
   for (let index = 0; index < contents.length; index++) {
     const hole = contents[index]!
     const value = values[hole.slot]
-    if (Array.isArray(value)) fillContent(inst, rec, def, hole, value)
-    else host.setText(points[hole.point], textIn(value))
+    if (Array.isArray(value)) fillContent(inst, rec, hole, value)
+    else host.setText(points[hole.point], View.slotText(value))
   }
   host.row?.(node, rec)
   return rec
@@ -115,51 +96,48 @@ const createTemplate = (inst: Instance, view: View.TemplateNode): Rec => {
 
 const noViews: ReadonlyArray<View.Node<any, any>> = Object.freeze([])
 
-const textIn = (value: unknown): string =>
-  value === undefined || value === null || value === false
-    ? ""
-    : typeof value === "string"
-    ? value
-    : String(value)
-
-// A content slot's nodes: a list `h.list` gave as it is, which keeps what it
-// says about how it changed, and any other array as `children` takes it.
-const nodesIn = (
-  value: ReadonlyArray<unknown>
-): ReadonlyArray<View.Node<any, any>> =>
-  View.isList(value) ? value : View.children(value as never)
-
 // What a content slot's record holds as its view: the nodes it holds, which
-// `patchKids` patches from, on an element with nothing to release.
+// `patchKids` patches from, on an element with nothing to release or restore.
 const contentView = (
   children: ReadonlyArray<View.Node<any, any>>
 ): View.Element<any, any> =>
-  ({ _tag: "Element", children, mount: undefined }) as unknown as View.Element<
-    any,
-    any
-  >
+  ({
+    _tag: "Element",
+    props: View.noFields,
+    children,
+    mount: undefined
+  }) as unknown as View.Element<any, any>
 
-// The records of a template's content slots, one for each, which the
-// template's record holds as its kids, so releasing it releases what they
-// hold. Made when a slot first holds nodes: a slot holding text needs none.
-const contentRecs = (
-  inst: Instance,
-  rec: Rec,
-  def: View.TemplateDef
-): Array<Rec> => {
-  if (rec.kids !== undefined && rec.kids !== unmade) return rec.kids
-  const contents = def.contents
-  const made: Array<Rec> = new Array(contents.length)
-  for (let index = 0; index < contents.length; index++) {
-    made[index] = new Rec(
-      contentView(noViews),
-      rec.points![contents[index]!.owner],
-      undefined,
-      inst
-    )
+// The record of a template's content slot, of the ones the template's record
+// holds as its kids, so releasing it releases what they hold. Made when a
+// slot first holds nodes: a slot holding text needs none.
+const contentRec = (inst: Instance, rec: Rec, hole: View.TemplateHole): Rec => {
+  let kids = rec.kids
+  if (kids === undefined || kids === unmade) {
+    const contents = (rec.v as View.TemplateNode)["~t"].contents
+    kids = rec.kids = new Array(contents.length)
+    for (let index = 0; index < contents.length; index++) {
+      kids[index] = new Rec(
+        contentView(noViews),
+        rec.points![contents[index]!.owner],
+        undefined,
+        inst
+      )
+    }
   }
-  rec.kids = made
-  return made
+  return kids[hole.index]!
+}
+
+// Patches a content slot's nodes to the ones `value` holds, or to none.
+const patchNodes = (
+  inst: Instance,
+  slot: Rec,
+  parent: unknown,
+  views: ReadonlyArray<View.Node<any, any>>
+): void => {
+  slot.plain = false
+  patchKids(inst, slot, parent, slot.v as View.Element<any, any>, views)
+  slot.v = contentView(views)
 }
 
 // Puts nodes in a content slot that holds text: its text node is taken out,
@@ -167,22 +145,16 @@ const contentRecs = (
 const fillContent = (
   inst: Instance,
   rec: Rec,
-  def: View.TemplateDef,
   hole: View.TemplateHole,
   value: ReadonlyArray<unknown>
 ): void => {
-  const slot = contentRecs(inst, rec, def)[hole.index]!
-  slot.plain = false
   const parent = rec.points![hole.owner]
-  const views = nodesIn(value)
-  // As `create` checks an element's children.
-  if (dev && views.length > 1) checkKeys(inst.path, views)
   inst.tree.host.remove(parent, rec.points![hole.point])
-  slot.kids = views.length > 0 ? createAll(inst, parent, views) : undefined
-  slot.v = contentView(views)
+  patchNodes(inst, contentRec(inst, rec, hole), parent, View.nodesIn(value))
 }
 
-// Patches a content slot whose value was or is an array of nodes.
+// Patches a content slot that held `was` to `value`, when either is an array
+// of nodes.
 const patchContent = (
   inst: Instance,
   rec: Rec,
@@ -191,34 +163,24 @@ const patchContent = (
   value: unknown
 ): void => {
   if (!Array.isArray(was)) {
-    return fillContent(
-      inst,
-      rec,
-      (rec.v as View.TemplateNode)["~t"],
-      hole,
-      value as ReadonlyArray<unknown>
-    )
+    return fillContent(inst, rec, hole, value as ReadonlyArray<unknown>)
   }
-  const host = inst.tree.host
   const points = rec.points!
   const parent = points[hole.owner]
   const slot = rec.kids![hole.index]!
-  slot.plain = false
   if (Array.isArray(value)) {
-    const views = nodesIn(value)
-    patchKids(inst, slot, parent, slot.v as View.Element<any, any>, views)
-    slot.v = contentView(views)
-    return
+    return patchNodes(inst, slot, parent, View.nodesIn(value))
   }
   // Text again: the nodes go, and the text node comes back.
-  patchKids(inst, slot, parent, slot.v as View.Element<any, any>, noViews)
-  slot.v = contentView(noViews)
-  host.setText(points[hole.point], textIn(value))
+  patchNodes(inst, slot, parent, noViews)
+  const host = inst.tree.host
+  host.setText(points[hole.point], View.slotText(value))
   host.insert(parent, points[hole.point], null)
 }
 
 // Patches an element a template made with the slots of the same template's
-// next one: only the slots whose values changed are written.
+// next one: only the slots whose values changed are written. Handlers aren't
+// among them: one is read off the values when its event comes.
 const patchTemplate = (
   inst: Instance,
   rec: Rec,
@@ -228,46 +190,62 @@ const patchTemplate = (
   rec.v = view
   // Patched, so `restore` looks inside it again, as for any element.
   rec.plain = false
+  const host = inst.tree.host
+  // Once the tree has set a property the host controls, the nodes of a
+  // content slot given again have theirs written again, as a kept element's
+  // are.
+  const restores = inst.tree.restores === true
   const before = prev.values
   const after = view.values
-  const host = inst.tree.host
-  // Once the tree has set a property, a content slot given the same nodes
-  // again is patched anyway, so their controlled properties are set again,
-  // as a kept element's are.
-  const restores = inst.tree.restores === true
-  if (before === after && !restores) return
-  // Handlers aren't among them: one is read off the values when its event comes.
-  const holes = view["~t"].writes
-  for (let index = 0; index < holes.length; index++) {
-    const hole = holes[index]!
+  if (before === after) {
+    if (restores) restore(host, rec)
+    return
+  }
+  const points = rec.points!
+  const def = view["~t"]
+  const texts = def.texts
+  for (let index = 0; index < texts.length; index++) {
+    const hole = texts[index]!
     const value = after[hole.slot]
-    const was = before[hole.slot]
-    if (
-      value === was &&
-      !(restores && hole.kind === "content" && Array.isArray(value))
-    ) continue
-    if (
-      hole.kind === "content" && (Array.isArray(value) || Array.isArray(was))
-    ) {
-      patchContent(inst, rec, hole, was, value)
-    } else if (hole.kind === "text" || hole.kind === "content") {
-      host.setText(
-        rec.points![hole.point],
-        value === undefined || value === null || value === false
-          ? ""
-          : String(value)
-      )
-    } else {
-      writeHole(
-        host,
-        hole,
-        rec.points![hole.point],
-        slotValue(after, hole.slot),
-        slotValue(before, hole.slot)
-      )
+    if (value !== before[hole.slot]) {
+      host.setText(points[hole.point], View.slotText(value))
     }
   }
+  const attrs = def.attrs
+  for (let index = 0; index < attrs.length; index++) {
+    const hole = attrs[index]!
+    const value = after[hole.slot]
+    const was = before[hole.slot]
+    if (value !== was) writeAttr(host, hole, points[hole.point], value, was)
+  }
+  const contents = def.contents
+  for (let index = 0; index < contents.length; index++) {
+    const hole = contents[index]!
+    const value = after[hole.slot]
+    const was = before[hole.slot]
+    if (value === was) {
+      if (restores && Array.isArray(value)) {
+        restore(host, rec.kids![hole.index]!)
+      }
+    } else if (Array.isArray(value) || Array.isArray(was)) {
+      patchContent(inst, rec, hole, was, value)
+    } else host.setText(points[hole.point], View.slotText(value))
+  }
 }
+
+/**
+ * The views of the kids of `view`'s record, made by a template's
+ * operations: one for each content slot, holding the slot's nodes.
+ *
+ * @internal
+ */
+export const kidViews = (
+  view: View.TemplateNode
+): ReadonlyArray<View.Node<any, any>> =>
+  view["~t"].contents.map((hole) => {
+    const value = view.values[hole.slot]
+    return contentView(Array.isArray(value) ? View.nodesIn(value) : noViews)
+  })
 
 /**
  * The operations a template made with `Html.template` renders with.

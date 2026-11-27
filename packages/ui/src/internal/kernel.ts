@@ -1637,9 +1637,7 @@ export const pairs = (
   if (old === view) return true
   switch (old._tag) {
     case "Element":
-      return view._tag === "Element" && old.tag === view.tag &&
-        old.elementKey === view.elementKey &&
-        (old as View.TemplateNode)["~t"] === (view as View.TemplateNode)["~t"]
+      return view._tag === "Element" && pairsElement(old, view)
     case "Text":
       return view._tag === "Text"
     case "Child":
@@ -1661,6 +1659,14 @@ const patch = (inst: Instance, old: Rec, view: View.Node<any, any>): Rec => {
   if (!pairs(prev, view)) return replace(inst, old, view)
   return patchPaired(inst, old, prev, view)
 }
+
+// `pairs`, for two elements: the same tag, key and template.
+const pairsElement = (
+  old: View.Element<any, any>,
+  view: View.Element<any, any>
+): boolean =>
+  old.tag === view.tag && old.elementKey === view.elementKey &&
+  (old as View.TemplateNode)["~t"] === (view as View.TemplateNode)["~t"]
 
 // `patch`, for a view that `pairs` with the one before, `prev`, and isn't it.
 const patchPaired = (
@@ -1784,9 +1790,16 @@ const controls = (
   return false
 }
 
-// Only element descendants are scanned. Patching a changed element also patches
-// its element ancestors, clearing `plain` so the next restore scans them again.
-const restore = (host: Host, rec: Rec): boolean => {
+/**
+ * Writes the controlled properties of `rec`'s element and of the elements
+ * below it again, as the user may have changed them. Whether there were
+ * any. Only element descendants are scanned. Patching a changed element
+ * also patches its element ancestors, clearing `plain` so the next restore
+ * scans them again.
+ *
+ * @internal
+ */
+export const restore = (host: Host, rec: Rec): boolean => {
   if (rec.plain) return false
   const view = rec.v as View.Element<any, any>
   let found = false
@@ -1876,13 +1889,10 @@ const patchElement = (
   prev: View.Element<any, any>,
   view: View.Element<any, any>
 ): void => {
-  const def = (view as View.TemplateNode)["~t"]
-  // `points` is set on a record that the template's operations made.
-  if (
-    def !== undefined && (prev as View.TemplateNode)["~t"] === def &&
-    rec.points !== undefined
-  ) {
-    return def.kernel!.patch(
+  // `points` is set on a record a template's operations made, and `prev`
+  // and `view` pair, so both are of that template.
+  if (rec.points !== undefined) {
+    return (view as View.TemplateNode)["~t"].kernel!.patch(
       inst,
       rec,
       prev as View.TemplateNode,
@@ -1915,7 +1925,8 @@ const patchElement = (
 
 /**
  * Patches `rec`'s kids, made for `prev.children`, to `views`, in `node`: an
- * element's children, or the nodes a template's content slot holds.
+ * element's children, or the nodes a template's content slot holds. The
+ * kids are made: `patchElement` makes a copied row's first.
  *
  * @internal
  */
@@ -1934,7 +1945,7 @@ export const patchKids = (
     views === before && views.length > 0 &&
     inst.tree.restores !== true
   ) return
-  const olds = rec.kids === unmade ? kidsOf(rec, prev) : rec.kids
+  const olds = rec.kids
   if (dev && views.length > 1) checkKeys(inst.path, views)
   // Children `h.list` gave, which say how they changed: only those nodes.
   const hint = olds === undefined ? undefined : View.takeListHint(views)
@@ -1974,8 +1985,7 @@ export const patchKids = (
       old.v = next
     } else if (
       next._tag === "Element" && old.v !== next && old.v._tag === "Element" &&
-      old.v.tag === next.tag && old.v.elementKey === next.elementKey &&
-      (old.v as View.TemplateNode)["~t"] === (next as View.TemplateNode)["~t"]
+      pairsElement(old.v, next)
     ) {
       patchElement(inst, old, old.v, next)
     } else olds[0] = patch(inst, old, next)
@@ -1999,19 +2009,8 @@ const patchChanged = (
     const prev = old.v
     const view = views[at]!
     if (prev === view) continue
-    if (
-      old.points !== undefined && view._tag === "Element" &&
-      (view as View.TemplateNode)["~t"] === (prev as View.TemplateNode)["~t"] &&
-      view.elementKey === (prev as View.Element<any, any>).elementKey
-    ) {
-      ;(view as View.TemplateNode)["~t"].kernel!.patch(
-        inst,
-        old,
-        prev as View.TemplateNode,
-        view as View.TemplateNode
-      )
-    } else if (pairs(prev, view)) olds[at] = patchPaired(inst, old, prev, view)
-    else return false
+    if (!pairs(prev, view)) return false
+    olds[at] = patchPaired(inst, old, prev, view)
   }
   return true
 }
@@ -2028,25 +2027,12 @@ const patchTraded = (
   start: number,
   end: number
 ): void => {
-  const host = inst.tree.host
-  const kept = inst.tree.restores !== true
-  const first = olds[end]!
+  // `patch` keeps a node given again as it was: a tree that restores
+  // properties doesn't take this path.
   const last = olds[start]!
-  olds[start] = first.v === views[start] && kept
-    ? first
-    : patch(inst, first, views[start]!)
-  olds[end] = last.v === views[end] && kept
-    ? last
-    : patch(inst, last, views[end]!)
-  place(host, parent, olds[start]!, nodeOf(olds[end]!))
-  if (end > start + 1) {
-    place(
-      host,
-      parent,
-      olds[end]!,
-      end + 1 < views.length ? nodeOf(olds[end + 1]!) : null
-    )
-  }
+  olds[start] = patch(inst, olds[end]!, views[start]!)
+  olds[end] = patch(inst, last, views[end]!)
+  moveTraded(inst.tree.host, parent, olds, start, end, null)
 }
 
 // Patches the kids of an element whose children were a list `h.list` gave
@@ -2155,22 +2141,8 @@ const patchList = (
       out[start] = kept ? old : patch(inst, old, view)
     } else if (prev._tag === "Element" && view._tag === "Element") {
       // `pairs` and `patchPaired` for the common case, written out.
-      if (
-        prev.tag !== view.tag || prev.elementKey !== view.elementKey ||
-        (prev as View.TemplateNode)["~t"] !== (view as View.TemplateNode)["~t"]
-      ) break
-      const def = (view as View.TemplateNode)["~t"]
-      if (
-        def !== undefined && (prev as View.TemplateNode)["~t"] === def &&
-        old.points !== undefined
-      ) {
-        def.kernel!.patch(
-          inst,
-          old,
-          prev as View.TemplateNode,
-          view as View.TemplateNode
-        )
-      } else patchElement(inst, old, prev, view)
+      if (!pairsElement(prev, view)) break
+      patchElement(inst, old, prev, view)
       out[start] = old
     } else if (pairs(prev, view)) {
       out[start] = patchPaired(inst, old, prev, view)
@@ -2190,7 +2162,7 @@ const patchList = (
     const view = views[end]!
     if (prev === view) {
       // Kept as it is, so set here: the loop after the middle skips it.
-      if (kept && out !== olds) out[end] = olds[oldEnd]!
+      if (kept) out[end] = olds[oldEnd]!
     } else if (!pairs(prev, view)) break
     oldEnd--
     end--
@@ -2269,7 +2241,7 @@ const patchList = (
     index < views.length;
     index++
   ) {
-    if (out[index] !== undefined && out !== olds) continue
+    if (out[index] !== undefined) continue
     const old = olds[index + shift]!
     const view = views[index]!
     out[index] = old.v === view && kept ? old : patch(inst, old, view)

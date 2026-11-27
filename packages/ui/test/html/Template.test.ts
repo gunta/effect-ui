@@ -703,6 +703,43 @@ describe("Html.template", { concurrent: false }, () => {
       assert.deepStrictEqual(root.model()!.seen, ["select 1", "select 1"])
     }).pipe(Effect.scoped))
 
+  it.effect("a pointer move that a row's handler slot leaves out goes on to the element around the row", () =>
+    Effect.gen(function*() {
+      const Cell = Html.template<string, { readonly move: string | undefined }>(
+        // `undefined` leaves the handler out, as it leaves an attribute out.
+        (h, $) => h.span.on("pointermove", $.move as string).children("cell")
+      )
+      const Grid = Html.component({
+        name: "Grid",
+        model: Schema.Array(Schema.String),
+        message: Schema.String
+      }).make({
+        init: (): ReadonlyArray<string> => [],
+        update: ($, message) => [...$.model, message],
+        view: (h) =>
+          h.div.on("pointermove", "around").children(
+            Cell({ move: undefined }),
+            Cell({ move: "cell" })
+          )
+      })
+      const app = yield* container
+      const root = yield* BrowserHost.mountEffect(Grid, {}, app)
+      const move = (element: Element) =>
+        element.dispatchEvent(
+          new PointerEvent("pointermove", {
+            bubbles: true,
+            pointerId: 1,
+            pointerType: "mouse"
+          })
+        )
+      const [none, cell] = app.querySelectorAll("span")
+      move(none!)
+      yield* tick
+      move(cell!)
+      yield* tick
+      assert.deepStrictEqual(root.model(), ["around", "cell"])
+    }).pipe(Effect.scoped))
+
   it.effect("a handler slot sends false and null as on does", () =>
     Effect.gen(function*() {
       const Answer = Schema.NullOr(Schema.Boolean)
