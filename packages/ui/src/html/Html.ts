@@ -1870,7 +1870,7 @@ const makeTags = (): Readonly<
 > => {
   const out: Record<string, VoidElement<any, any, any, any>> = {}
   for (const tag of containerTags) out[tag] = View.shorthand(new Element(tag))
-  for (const tag of voidTags) out[tag] = new VoidElement(tag)
+  for (const tag of voidTags) out[tag] = View.markRoot(new VoidElement(tag))
   // An SVG element is an `Element` at runtime; `SvgElement` narrows its type.
   for (const tag of svgTags) {
     out[tag === "text" ? "svgText" : tag] = View.shorthand(new Element(tag))

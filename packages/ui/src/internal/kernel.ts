@@ -60,10 +60,12 @@ export interface Host<N = any> {
    */
   readonly clone?: ((node: N) => N) | undefined
   readonly firstOf?: ((node: N) => N | null) | undefined
-  /** With `clone`: whether a node is text, and the record `setEvents` gave it first. */
-  readonly isText?: ((node: N) => boolean) | undefined
-  /** With `clone`: an element node's tag, as a view names it. */
-  readonly tagOf?: ((node: N) => string) | undefined
+  /**
+   * With `clone`: what a node is, as a view names it: `"#text"` for text, an
+   * element's tag for an element.
+   */
+  readonly kindOf?: ((node: N) => string) | undefined
+  /** With `clone`: the record `setEvents` gave a node first. */
   readonly recOf?: ((node: N) => Rec | undefined) | undefined
   readonly commit?: (() => void) | undefined
   readonly unmounting?:
@@ -278,8 +280,11 @@ export interface Tree {
     | ((child: Instance, inst: Instance, view: View.Child<any, any>) => boolean)
     | undefined
   held?: ((at: string) => boolean) | undefined
-  /** Whether an element of the tree has had properties, which a patch that keeps a node sets again. */
-  props?: boolean | undefined
+  /**
+   * Whether an element of the tree has had a property the host controls,
+   * which a patch that keeps the element's node writes again: see `controls`.
+   */
+  restores?: boolean | undefined
   dirty: Array<Instance>
   scheduled: boolean
   flushing: boolean
@@ -1311,10 +1316,7 @@ const copies = (view: View.Node<any, any>): boolean =>
 const plainShape = (view: View.Node<any, any>): boolean => {
   if (view._tag === "Text") return true
   if (
-    view._tag !== "Element" || view.props !== View.noFields ||
-    view.mount !== undefined || view.refKey !== undefined ||
-    (view.owned !== undefined && view.owned.length > 0) ||
-    view.tag === "form" || view.tag === "script" || view.tag.includes("-")
+    view._tag !== "Element" || !View.isPlain(view) || !View.isPlainTag(view.tag)
   ) return false
   const children = view.children
   for (let index = 0; index < children.length; index++) {
@@ -1414,15 +1416,13 @@ const untouched = (
 }
 
 // Whether `view` can be built from a copy of `prev`'s nodes, as far as the
-// element itself goes.
+// element itself goes. Its tag is `prev`'s, which `plainShape` accepted.
 const copiesAs = (
   prev: View.Element<any, any>,
   view: View.Element<any, any>
 ): boolean =>
   prev.tag === view.tag && prev.children.length === view.children.length &&
-  view.props === View.noFields && view.mount === undefined &&
-  view.refKey === undefined &&
-  (view.owned === undefined || view.owned.length === 0)
+  View.isPlain(view)
 
 /**
  * The records of the kids of `rec`, an element whose view was `prev`, made
@@ -1445,12 +1445,12 @@ export const kidsOf = (
   let child = host.firstOf!(rec.node)
   for (let index = 0; index < views.length; index++) {
     const view = views[index]!
-    // A node that isn't the kind, or the tag, the view made: something
-    // replaced it, and its record would patch the wrong element.
+    // A node that isn't what the view made: something replaced it, and its
+    // record would patch the wrong element.
     if (
-      child === null || host.isText!(child) !== (view._tag === "Text") ||
-      (view._tag === "Element" && host.tagOf !== undefined &&
-        host.tagOf(child) !== view.tag)
+      child === null ||
+      host.kindOf!(child) !==
+        (view._tag === "Text" ? "#text" : (view as View.Element<any, any>).tag)
     ) return rebuild(rec, prev)
     if (view._tag === "Text") {
       made[index] = new Rec(view, child, undefined, rec.inst)
@@ -1513,7 +1513,9 @@ export const create = (inst: Instance, view: View.Node<any, any>): Rec => {
       if (dev && views.length > 1) checkKeys(inst.path, views)
       if (views.length > 0) kids = createAll(inst, node, views)
       if (view.props !== View.noFields) {
-        inst.tree.props = true
+        if (inst.tree.restores !== true && controls(host, view.props)) {
+          inst.tree.restores = true
+        }
         setProps(host, node, view.props)
       }
       host.made?.(node, inst)
@@ -1588,10 +1590,9 @@ export const pairs = (
 const patch = (inst: Instance, old: Rec, view: View.Node<any, any>): Rec => {
   const prev = old.v
   if (prev === view) {
-    if (
-      inst.tree.props === true && view._tag === "Element" &&
-      inst.tree.host.controlled !== undefined
-    ) restore(inst.tree.host, old)
+    if (inst.tree.restores === true && view._tag === "Element") {
+      restore(inst.tree.host, old)
+    }
     return old
   }
   if (!pairs(prev, view)) return replace(inst, old, view)
@@ -1705,6 +1706,21 @@ export const replace = (
 
 const refreshed = {}
 
+// Whether `props` holds a property `host` controls, such as the DOM's
+// `value`, which the user changes without a patch, so a patch writes it
+// again even when it hasn't changed.
+const controls = (
+  host: Host,
+  props: Readonly<Record<string, unknown>>
+): boolean => {
+  const controlled = host.controlled
+  if (controlled === undefined) return false
+  for (const name in props) {
+    if (controlled.has(name)) return true
+  }
+  return false
+}
+
 // Only element descendants are scanned. Patching a changed element also patches
 // its element ancestors, clearing `plain` so the next restore scans them again.
 const restore = (host: Host, rec: Rec): boolean => {
@@ -1733,6 +1749,9 @@ const sameAttrs = (
   before: Readonly<Record<string, string>>,
   attrs: Readonly<Record<string, string>>
 ): boolean => {
+  // Shared records are common: `classOnly` and `extended` give one to every
+  // element with the same class.
+  if (before === attrs) return true
   let count = 0
   for (const name in before) {
     if (before[name] !== attrs[name]) return false
@@ -1846,7 +1865,9 @@ const patchElement = (
     prev.props !== view.props ||
     (host.controlled !== undefined && view.props !== View.noFields)
   ) {
-    if (view.props !== View.noFields) inst.tree.props = true
+    if (inst.tree.restores !== true && controls(host, view.props)) {
+      inst.tree.restores = true
+    }
     patchProps(host, node, prev.props, view.props)
   }
   const mount = view.mount as unknown as Attachable | undefined
@@ -1890,8 +1911,8 @@ const patchList = (
   let end = views.length - 1
   let out: Array<Rec> = oldEnd === end ? olds : new Array(views.length)
   // A node given again as it was, such as `h.lazy`'s, is kept without a
-  // call, unless the tree has properties to set again.
-  const kept = inst.tree.props !== true || host.controlled === undefined
+  // call, unless the tree has properties to write again.
+  const kept = inst.tree.restores !== true
   while (start <= oldEnd && start <= end) {
     const old = olds[start]!
     const view = views[start]!
@@ -2058,25 +2079,34 @@ const patchSwap = (
   after: unknown
 ): Array<Rec> => {
   const host = inst.tree.host
-  const kept = inst.tree.props !== true || host.controlled === undefined
+  const kept = inst.tree.restores !== true
   out[start] = patch(inst, olds[end]!, views[start]!)
   for (let index = start + 1; index < views.length; index++) {
     const old = olds[index === end ? start : index]!
     const view = views[index]!
     out[index] = old.v === view && kept ? old : patch(inst, old, view)
   }
-  // A move takes a node out of the document, so none moves that needn't: of
-  // two neighbours, only one.
-  place(host, parent, out[start]!, nodeOf(out[end]!))
-  if (end > start + 1) {
-    place(
-      host,
-      parent,
-      out[end]!,
-      end + 1 < views.length ? nodeOf(out[end + 1]!) : after
-    )
-  }
+  moveTraded(host, parent, out, start, end, after)
   return out
+}
+
+// Moves the nodes of `recs[start]` and `recs[end]`, two kids that traded
+// places, to where they now belong. `after` is the node after the last kid.
+// A move takes a node out of the document, so none moves that needn't: of
+// two neighbours, only one.
+const moveTraded = (
+  host: Host,
+  parent: unknown,
+  recs: Array<Rec>,
+  start: number,
+  end: number,
+  after: unknown
+): void => {
+  place(host, parent, recs[start]!, nodeOf(recs[end]!))
+  if (end > start + 1) {
+    const next = end + 1 < recs.length ? nodeOf(recs[end + 1]!) : after
+    place(host, parent, recs[end]!, next)
+  }
 }
 
 const increasing = (sources: Int32Array): Array<number> => {

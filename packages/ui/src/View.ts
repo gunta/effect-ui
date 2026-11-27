@@ -299,6 +299,27 @@ export interface Element<out Msg, out R = never> {
 }
 
 /**
+ * Whether a host makes all of `element` from its tag, attributes, handlers
+ * and children: it sets no property, mount, ref or part layer. With
+ * `isPlainTag`, a copy of another such element's node can stand for its own.
+ *
+ * @internal
+ */
+export const isPlain = (element: Element<any, any>): boolean =>
+  element.props === noFields && element.mount === undefined &&
+  element.refKey === undefined &&
+  (element.owned === undefined || element.owned.length === 0)
+
+/**
+ * Whether an element of `tag` is no more than its markup: not a form, a
+ * script or a custom element, whose node does more than a copy of it shows.
+ *
+ * @internal
+ */
+export const isPlainTag = (tag: string): boolean =>
+  tag !== "form" && tag !== "script" && !tag.includes("-")
+
+/**
  * What `onMount` stores: the issued mount, with its name, its args and the
  * map from its result to a message.
  *
@@ -2223,12 +2244,23 @@ export const shorthand = <
     (root as any).children(...inputs)
   Object.setPrototypeOf(root, Object.getPrototypeOf(builder))
   Object.assign(root, builder)
-  // A root is shared and never given another field, so one that holds the
-  // base fields only is copied as the copier's builders are.
+  return markRoot(root as any)
+}
+
+/**
+ * Marks a vocabulary's root builder, which every render shares and nothing
+ * gives another field, to be copied as a copier's builders are when it holds
+ * the base fields only. A `shorthand` root is marked already. Returns it.
+ *
+ * @internal
+ */
+export const markRoot = <B extends ElementBuilder<any, any, any, any>>(
+  builder: B
+): B => {
   let fields = 0
-  for (const _ in root) fields++
-  if (fields === builderFields.length) (root as any)[copied] = true
-  return root as any
+  for (const _ in builder) fields++
+  if (fields === builderFields.length) (builder as any)[copied] = true
+  return builder
 }
 
 /**
