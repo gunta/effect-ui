@@ -1397,12 +1397,13 @@ const fill = (
 
 // Whether a copy of `was`'s node is already `view`'s, so `fill` has nothing
 // to write to it: the same text, or the same element without children or
-// handlers.
+// handlers. Not every view that is `was` itself: a copy of a node doesn't
+// carry its record, so an element with handlers, at any depth, needs `fill`
+// to give the copy one.
 const untouched = (
   was: View.Node<any, any>,
   view: View.Node<any, any>
 ): boolean => {
-  if (was === view) return true
   if (was._tag === "Text") return view._tag === "Text" && was.text === view.text
   return view._tag === "Element" && view.children.length === 0 &&
     view.handlers === View.noFields && view.eventOptions === View.noFields &&
@@ -1788,6 +1789,10 @@ const patchElement = (
   view: View.Element<any, any>
 ): void => {
   const host = inst.tree.host
+  // A row built from a copy makes its kids' records now, before anything is
+  // written: if its nodes changed under it, it's built again from `prev`,
+  // and this patch then goes to the new node.
+  if (rec.kids === unmade) kidsOf(rec, prev)
   const node = rec.node
   const layers = view.owned?.length ? view.owned : prev.owned
   if (layers?.length) view = owned(inst, view, layers)

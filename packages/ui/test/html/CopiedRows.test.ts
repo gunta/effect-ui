@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { UiSchema } from "@effect/ui"
+import { UiSchema, View } from "@effect/ui"
 import { BrowserHost, Html } from "@effect/ui/html"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Schema } from "effect"
@@ -225,7 +225,59 @@ describe("rows built from a copy", { concurrent: false }, () => {
         yield* tick
         assert.deepStrictEqual(root.model()!.clicks, [3])
       }).pipe(Effect.scoped))
+
+    it.effect(`${variant}: a row rebuilt in the render that changes it shows the change`, () =>
+      Effect.gen(function*() {
+        const app = yield* container
+        const root = yield* BrowserHost.mountEffect(Table, {}, app)
+        root.send(Message.Set({ rows: rowsOf(1, 5) }))
+        yield* tick
+        // A node the runtime didn't make, so the row is built again on its
+        // first patch, which here also changes its class and its label.
+        app.querySelectorAll("tbody tr")[2]!.appendChild(
+          document.createElement("td")
+        )
+        root.send(Message.Label({ id: 3, label: "patched" }))
+        root.send(Message.Select({ id: 3 }))
+        yield* tick
+        assert.strictEqual(
+          app.querySelector("tbody")!.innerHTML,
+          expected(root.model()!)
+        )
+        labelOf(app, 2).click()
+        yield* tick
+        assert.deepStrictEqual(root.model()!.clicks, [3, 3])
+      }).pipe(Effect.scoped))
   }
+
+  it.effect("a child every row shares keeps its handler in rows built from a copy", () =>
+    Effect.gen(function*() {
+      // One node for every row, as a view that builds a control once does.
+      let shared: View.Node<Message> | undefined
+      const Shared = Def.make({
+        init: () => ({ rows: [], selected: 0, clicks: [] }),
+        update,
+        view: (h, model) => {
+          shared ??= View.toNode(
+            h.button.on("click", Message.Select({ id: 0 })).children("pick")
+          )
+          return h.ul.children(
+            model.rows.map((row) =>
+              h.li.key(String(row.id)).children(h.span(row.label), shared!)
+            )
+          )
+        }
+      })
+      const app = yield* container
+      const root = yield* BrowserHost.mountEffect(Shared, {}, app)
+      root.send(Message.Set({ rows: rowsOf(1, 3) }))
+      yield* tick
+      const buttons = app.querySelectorAll<HTMLElement>("button")
+      assert.strictEqual(buttons.length, 3)
+      for (const button of buttons) button.click()
+      yield* tick
+      assert.deepStrictEqual(root.model()!.clicks, [0, 0, 0])
+    }).pipe(Effect.scoped))
 
   const field = <M>(h: Html.H<M>, value: string) =>
     h.li.key(value).children(h.input.value(value))
