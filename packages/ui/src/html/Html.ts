@@ -148,6 +148,7 @@ import * as Schema from "effect/Schema"
 import type * as Types from "effect/Types"
 import * as Component from "../Component.ts"
 import { handle } from "../internal/handler.ts"
+import * as Templates from "../internal/templates.ts"
 import * as Renderer from "../Renderer.ts"
 import * as View from "../View.ts"
 import type * as HtmlHead from "./HtmlHead.ts"
@@ -2016,7 +2017,11 @@ export const template = <Msg, Values extends Record<string, unknown>>(
 ): (
   values: Values
 ) => View.Element<Msg, View.Requirements<Values[keyof Values]>> =>
-  View.template(View.makeHelper<Msg, unknown, Elements>({}, vocabulary), build)
+  View.makeTemplate(
+    View.makeHelper<Msg, unknown, Elements>({}, vocabulary),
+    build,
+    Templates.kernel
+  )
 
 // ---------------------------------------------------------------------------
 // refs

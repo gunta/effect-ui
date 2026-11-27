@@ -666,6 +666,48 @@ describe("Html.template", { concurrent: false }, () => {
       assert.isUndefined(def.lastCopy)
     }))
 
+  it.effect("a template made with View.template renders in the browser as any element", () =>
+    Effect.gen(function*() {
+      // Without Html.template's operations, the browser host builds and
+      // patches the element the template reads as.
+      const Plain = View.template(
+        View.makeHelper<Message, {}>({}, undefined),
+        (h, $: { readonly label: string; readonly pick: Message }) =>
+          h.el("p").children(h.el("a").on("click", $.pick).children($.label))
+      )
+      const first: Model = { items: itemsOf(1, 1), selected: 0, seen: [] }
+      const Shown = Html.component({
+        name: "Shown",
+        model: Model,
+        message: Message
+      }).make({
+        init: () => first,
+        update,
+        view: (_h, model) =>
+          Plain({
+            label: model.items[0]!.label,
+            pick: Message.Select({ id: model.items[0]!.id })
+          })
+      })
+      const app = yield* container
+      const root = yield* BrowserHost.mountEffect(Shown, {}, app)
+      assert.strictEqual(app.innerHTML, "<p><a>item 1</a></p>")
+      const def = (Plain({
+        label: "",
+        pick: Message.Select({ id: 0 })
+      }) as View.TemplateNode)[
+        "~t"
+      ]
+      assert.isUndefined(def.kernel)
+      assert.isUndefined(def.lastHost)
+      root.send(Message.Label({ id: 1, label: "patched" }))
+      yield* tick
+      assert.strictEqual(app.innerHTML, "<p><a>patched</a></p>")
+      app.querySelector<HTMLElement>("a")!.click()
+      yield* tick
+      assert.deepStrictEqual(root.model()!.seen, ["select 1"])
+    }).pipe(Effect.scoped))
+
   it("a content slot's nodes keep their requirements in the template's type", () => {
     const Box = Html.template<Message, {
       readonly body: ReadonlyArray<View.Node<Message, "Needed">>

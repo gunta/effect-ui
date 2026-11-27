@@ -2964,7 +2964,11 @@ class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
     // its key already.
     const make = (item: unknown, chosen: boolean) => {
       const content = render(this, item, chosen)
-      const node = content instanceof TemplateNode ? content : toNode(content)
+      // A template's element is a node already. Told apart by its field, not
+      // its class, so an app without templates doesn't keep the class.
+      const node = (content as TemplateNode)["~t"] !== undefined
+        ? content as TemplateNode
+        : toNode(content)
       // A row's text would join its neighbours'.
       if (node._tag === "Text") {
         throw new Error("h.list: render an element for each item, not text")
@@ -3251,11 +3255,13 @@ export const slotNodes = <Msg>(
  * `h.list` returns, which the element holds: the layout around a list can be
  * a template, and a render patches only the list.
  *
- * The browser host renders a template by copying the nodes it built for the
- * first one and writing the slots, and patches one by comparing its slots
- * with the last render's. Anything else that reads the element, such as the
- * server renderer, hydration or a test host, sees the same element a view
- * built with the helper would.
+ * The browser host renders a template made with `Html.template` by copying
+ * the nodes it built for the first one and writing the slots, and patches
+ * one by comparing its slots with the last render's: the code for that
+ * comes with `Html.template`, so an app that makes no template doesn't ship
+ * it. A template made with this function, and anything else that reads the
+ * element, such as the server renderer, hydration or a test host, sees the
+ * same element a view built with the helper would.
  *
  * @stability experimental
  * @category constructors
@@ -3264,9 +3270,44 @@ export const slotNodes = <Msg>(
 export const template = <Values extends Record<string, unknown>, H>(
   helper: H,
   build: (h: H, slots: Values) => Content<any, any>
+): (values: Values) => Element<any, Requirements<Values[keyof Values]>> =>
+  makeTemplate(helper, build, undefined)
+
+/**
+ * `template`, with the operations a host that copies nodes renders it with,
+ * as `Html.template` gives them. Without them, every host builds the
+ * template's element as it builds any other.
+ *
+ * @internal
+ */
+export const makeTemplate = <Values extends Record<string, unknown>, H>(
+  helper: H,
+  build: (h: H, slots: Values) => Content<any, any>,
+  kernel: TemplateKernel | undefined
 ): (values: Values) => Element<any, Requirements<Values[keyof Values]>> => {
-  const def = defineTemplate(toNode(build(helper, slotProxy as Values)))
+  const def = defineTemplate(
+    toNode(build(helper, slotProxy as Values)),
+    kernel
+  )
   return (values) => new TemplateNode(def, values)
+}
+
+/**
+ * How a host that copies nodes renders a template's elements: `create`
+ * builds one, returning its record, and `patch` patches one record made by
+ * `create` to the template's next element. Kept on the template, so the
+ * kernel only reaches them through a template that has them.
+ *
+ * @internal
+ */
+export interface TemplateKernel {
+  readonly create: (inst: unknown, view: TemplateNode) => unknown
+  readonly patch: (
+    inst: unknown,
+    rec: unknown,
+    prev: TemplateNode,
+    view: TemplateNode
+  ) => void
 }
 
 const slotMark = "\u0000@effect/ui/View/slot\u0000"
@@ -3379,9 +3420,14 @@ export interface TemplateDef {
    */
   lastHost: object | undefined
   lastCopy: unknown
+  /** The operations a host that copies nodes renders the template with. */
+  readonly kernel: TemplateKernel | undefined
 }
 
-const defineTemplate = (root: Node<any, any>): TemplateDef => {
+const defineTemplate = (
+  root: Node<any, any>,
+  kernel: TemplateKernel | undefined
+): TemplateDef => {
   if (root._tag !== "Element") {
     throw new Error("View.template: build an element")
   }
@@ -3586,7 +3632,8 @@ const defineTemplate = (root: Node<any, any>): TemplateDef => {
     blank,
     copies: new WeakMap(),
     lastHost: undefined,
-    lastCopy: undefined
+    lastCopy: undefined,
+    kernel
   }
 }
 
@@ -3715,4 +3762,6 @@ const fillSlots = (
  * @internal
  */
 export const asElement = <N extends Node<any, any>>(node: N): N =>
-  node instanceof TemplateNode ? node.element() as unknown as N : node
+  (node as unknown as TemplateNode)["~t"] !== undefined
+    ? (node as unknown as TemplateNode).element() as unknown as N
+    : node
