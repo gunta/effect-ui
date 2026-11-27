@@ -1,0 +1,16 @@
+{
+  "framework": "effect-ui-v0.0.0-6413803-keyed",
+  "keyed": true,
+  "benchmark": "22_run-memory",
+  "type": "memory",
+  "values": {
+    "DEFAULT": {
+      "min": 3.027937889099121,
+      "max": 3.027937889099121,
+      "median": 3.027937889099121,
+      "mean": 3.027937889099121,
+      "stddev": null,
+      "values": [3.027937889099121]
+    }
+  }
+}

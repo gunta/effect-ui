@@ -8,10 +8,16 @@
 // sets both up), and `page` an HTML file in it other than index.html, such as a copy pointing at
 // another build. Each sample opens a fresh page, runs the harness's init steps for the operation with
 // its CPU slowdown, and traces the one measured click as the harness does: with V8's sampling
-// profiler on, after a forced garbage collection, which sends code back to its unoptimized tiers. `script` is the time in the harness's
+// profiler on, after a forced last-resort garbage collection, which sends code back to its
+// unoptimized tiers. `script` is the time in the harness's
 // JavaScript events from the click to the end of the next commit, `total` the time to that commit.
 // The entries alternate sample by sample, so drift on the machine reaches them all alike. Each cell
 // is the median of the samples, `script / total` in milliseconds.
+//
+// Its clicks are Playwright's, not the harness's Puppeteer ones, and its numbers can differ from the
+// harness's more for one framework than another (Solid's remove row measured 0.83 ms here and 0.60 ms
+// in the harness): compare builds of one entry with it, and confirm a comparison between frameworks
+// with run.sh.
 //
 // The browser is `--chromium`, else `$CHROMIUM`, else `chromium` on PATH, else the Chromium that the
 // `playwright` dev dependency installed.
@@ -201,7 +207,11 @@ const sample = async (entry, name) => {
     ]
   })
   await page.waitForTimeout(50)
-  await page.evaluate(() => globalThis.gc())
+  // The harness's forceGC (forkedBenchmarkRunnerPuppeteer.ts): a last-resort collection, which also
+  // drops what V8 learned from running the code, so the click runs it cold.
+  await page.evaluate(() =>
+    globalThis.gc({ type: "major", execution: "sync", flavor: "last-resort" })
+  )
   await page.click(operation.run)
   await operation.done(page)
   await page.waitForTimeout(50)

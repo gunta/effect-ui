@@ -1,4 +1,4 @@
-import { type Component, UiSchema } from "@effect/ui"
+import { type Component, UiSchema, type View } from "@effect/ui"
 import { BrowserHost, Html } from "@effect/ui/html"
 import { Effect, Layer, Schema } from "effect"
 
@@ -119,13 +119,13 @@ const update = (
         rows: [...model.rows, ...buildRows(model.nextId, 1000)],
         nextId: model.nextId + 1000
       }
-    case "Update":
-      return {
-        ...model,
-        rows: model.rows.map((row, i) =>
-          i % 10 === 0 ? { ...row, label: row.label + " !!!" } : row
-        )
+    case "Update": {
+      const rows = model.rows.slice()
+      for (let i = 0; i < rows.length; i += 10) {
+        rows[i] = { ...rows[i]!, label: rows[i]!.label + " !!!" }
       }
+      return { ...model, rows }
+    }
     case "Clear":
       return { ...model, rows: [], selected: 0 }
     case "SwapRows": {
@@ -138,11 +138,13 @@ const update = (
     }
     case "Select":
       return { ...model, selected: message.id }
-    case "Remove":
-      return {
-        ...model,
-        rows: model.rows.filter((row) => row.id !== message.id)
-      }
+    case "Remove": {
+      const index = model.rows.findIndex((row) => row.id === message.id)
+      if (index < 0) return model
+      const rows = model.rows.slice()
+      rows.splice(index, 1)
+      return { ...model, rows }
+    }
   }
 }
 
@@ -154,8 +156,10 @@ const MainDef = Html.component({
   message: Message
 })
 type H = Component.Helper<typeof MainDef>
+// What the page template builds with.
+type T = Html.H<Message>
 
-const button = (h: H, id: string, title: string, message: Message) =>
+const button = (h: T, id: string, title: string, message: Message) =>
   h.div.class("col-sm-6", "smallpad").children(
     h.button.attr("id", id).attr("type", "button").class(
       "btn",
@@ -165,7 +169,7 @@ const button = (h: H, id: string, title: string, message: Message) =>
       .children(title)
   )
 
-const jumbotron = (h: H) =>
+const jumbotron = (h: T) =>
   h.div.class("jumbotron").children(
     h.div.class("row").children(
       h.div.class("col-md-6").children(h.h1.children("Effect UI keyed")),
@@ -182,15 +186,22 @@ const jumbotron = (h: H) =>
     )
   )
 
-// Built again only when its row or selection changes, like Foldkit's createKeyedLazy.
-const row = (h: H, row: Row, selected: boolean) =>
-  h.tr.key(String(row.id)).class(selected && "danger").children(
-    h.td.class("col-md-1").children(String(row.id)),
+// A row is a template: built once, and rendered by copying its nodes and
+// writing the values that differ.
+const RowView = Html.template<Message, {
+  readonly key: string
+  readonly label: string
+  readonly selected: string | undefined
+  readonly select: Message
+  readonly remove: Message
+}>((h, $) =>
+  h.tr.key($.key).class($.selected).children(
+    h.td.class("col-md-1").children($.key),
     h.td.class("col-md-4").children(
-      h.a.on("click", Message.Select({ id: row.id })).children(row.label)
+      h.a.on("click", $.select).children($.label)
     ),
     h.td.class("col-md-1").children(
-      h.a.on("click", Message.Remove({ id: row.id })).children(
+      h.a.on("click", $.remove).children(
         h.span.class("glyphicon", "glyphicon-remove").attr(
           "aria-hidden",
           "true"
@@ -199,25 +210,46 @@ const row = (h: H, row: Row, selected: boolean) =>
     ),
     h.td.class("col-md-6")
   )
+)
+
+const idOf = (row: Row) => row.id
+
+// Built again only when its row or whether it's selected changes.
+const row = (_h: H, row: Row, selected: boolean) =>
+  RowView({
+    key: String(row.id),
+    label: row.label,
+    selected: selected ? "danger" : undefined,
+    select: Message.Select({ id: row.id }),
+    remove: Message.Remove({ id: row.id })
+  })
+
+const preloadIcon = (h: T) =>
+  h.span.class("preloadicon", "glyphicon", "glyphicon-remove").attr(
+    "aria-hidden",
+    "true"
+  )
+
+// The page is a template too: copied once, with the rows in the slot that
+// is the tbody's only child. A render patches the rows, and nothing else.
+const Page = Html.template<Message, {
+  readonly rows: ReadonlyArray<View.Node<Message>>
+}>((h, $) =>
+  h.div.class("container").children(
+    jumbotron(h),
+    h.table.class("table", "table-hover", "table-striped", "test-data")
+      .children(h.tbody.children($.rows)),
+    preloadIcon(h)
+  )
+)
 
 const Main = MainDef.make({
   init: () => ({ rows: [], selected: 0, nextId: 1 }),
   update,
   view: (h, model) =>
-    h.div.class("container").children(
-      // Static, so built once and never patched.
-      h.lazy(jumbotron),
-      h.table.class("table", "table-hover", "table-striped", "test-data")
-        .children(
-          h.tbody.children(model.rows.map((item) =>
-            h.lazy(row, item, item.id === model.selected)
-          ))
-        ),
-      h.span.class("preloadicon", "glyphicon", "glyphicon-remove").attr(
-        "aria-hidden",
-        "true"
-      )
-    )
+    Page({
+      rows: h.list(model.rows, { key: idOf, selected: model.selected }, row)
+    })
 })
 
 // RUN

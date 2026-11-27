@@ -982,7 +982,7 @@ const forwardTo = <Msg, R>(
   }
   return builder.elementKey === undefined
     ? out
-    : { ...out, elementKey: builder.elementKey }
+    : { ...asElement(out), elementKey: builder.elementKey }
 }
 
 /**
@@ -1026,6 +1026,8 @@ export const withContent = <B extends ElementBuilder<any, any, any, any>>(
   out.content = content === undefined
     ? (inputs.length === 0
       ? noChildren
+      : inputs.length === 1 && isList(inputs[0])
+      ? inputs[0]
       : childrenOf(inputs as Array<Input<any, any>>))
     : inputs.length === 0
     ? content
@@ -1856,8 +1858,11 @@ export class ElementBuilder<
     handler: Handler<Msg, Handlers[K]>,
     options?: EventOptions | undefined
   ): this {
-    const own = ownFields(this)
-    let eventOptions = own.eventOptions
+    // Inside a part's forward hook, the handler joins the part's layer.
+    const rare = this["~rare"]
+    const own = rare.layer === undefined ? undefined : rare.owned[rare.layer]!
+    const was = own === undefined ? rare.eventOptions : own.eventOptions
+    let eventOptions = was
     if (eventOptions === noFields) {
       if (options !== undefined) {
         eventOptions = assoc(eventOptions, event, options)
@@ -1865,17 +1870,16 @@ export class ElementBuilder<
     } else if (options !== undefined || Object.hasOwn(eventOptions, event)) {
       eventOptions = withEntry(eventOptions, event, options)
     }
-    const handlers = assoc(own.handlers, event, handler)
-    if (this["~rare"].layer !== undefined) {
-      return withOwnFields(this, { handlers, eventOptions })
+    if (own !== undefined) {
+      return withOwnFields(this, {
+        handlers: assoc(own.handlers, event, handler),
+        eventOptions
+      })
     }
-    // Outside a part's forward hook, the usual case: `~rare` is copied only
-    // when the event options change.
+    // The usual case: `~rare` is copied only when the event options change.
     const out = copyBuilder(this) as Mutable<this>
-    out.handlers = handlers
-    if (eventOptions !== own.eventOptions) {
-      setRare(out, "eventOptions", eventOptions)
-    }
+    out.handlers = assoc(this.handlers, event, handler)
+    if (eventOptions !== was) setRare(out, "eventOptions", eventOptions)
     return out
   }
   /**
@@ -1896,7 +1900,7 @@ export class ElementBuilder<
    */
   attr(name: string, value: string | undefined): this {
     const attrs = this.elementAttrs
-    const removals = this.removals
+    const removals = this["~rare"].removals
     // A `shorthand` is a function whose chain methods must return a plain builder.
     if (
       value === undefined && removals === undefined &&
@@ -2489,6 +2493,53 @@ export interface HelperBase<Msg, Props> {
     fn: (h: H, ...args: A) => C,
     ...args: A
   ): Node<Msg, Requirements<C>>
+  /**
+   * The nodes `render` builds for `items`, each built again only when its
+   * item, or whether it's the selected one, changes: what a keyed list of
+   * rows, one of which may be selected, renders with.
+   *
+   * **Details**
+   *
+   * `key` names an item; `selected`, if given, is the key of the selected
+   * one, and `render` is told whether its item is it. An item is the same as
+   * the last render's when it's the same value, compared with `===`, so a
+   * Model that keeps the items it doesn't change keeps their nodes. `key`
+   * must give an item the same key on every render, as the keys of any keyed
+   * list do: it may be a new function each time, but one that names the
+   * items differently, such as by another field, keeps the last render's
+   * nodes and selection for items that didn't change. Show such a list under
+   * another `render`, or with new items.
+   *
+   * When `items` and `selected` are both the ones of the last render, the
+   * result is the last render's array, and the runtime skips the list. When
+   * only `selected` changes, only the rows that gain or lose it are built.
+   * `render` must depend only on its arguments, as `h.lazy`'s `fn` does, and
+   * should be declared outside the view: it tells lists apart, so a view that
+   * shows two lists gives each its own.
+   *
+   * **Example** (A table whose rows can be selected)
+   *
+   * ```ts
+   * import type { Html } from "@effect/ui/html"
+   *
+   * type Row = { readonly id: number; readonly label: string }
+   *
+   * const row = <M>(h: Html.H<M>, row: Row, selected: boolean) =>
+   *   h.tr.key(String(row.id)).class(selected && "danger").children(row.label)
+   *
+   * const rows = <M>(h: Html.H<M>, rows: ReadonlyArray<Row>, selected: number) =>
+   *   h.tbody.children(h.list(rows, { key: (row) => row.id, selected }, row))
+   * ```
+   */
+  list<H, A, K, C extends Content<Msg, any>>(
+    this: H,
+    items: ReadonlyArray<A>,
+    options: {
+      readonly key: (item: A) => K
+      readonly selected?: K | undefined
+    },
+    render: (h: H, item: A, selected: boolean) => C
+  ): ReadonlyArray<Node<Msg, Requirements<C>>>
 }
 
 /**
@@ -2499,6 +2550,8 @@ export interface HelperBase<Msg, Props> {
  */
 export class Lazies {
   entries = new Map<unknown, LazyEntry>()
+  /** What `h.list` keeps, by its `render` function. */
+  lists: Map<Function, ListState> | undefined = undefined
   /** The render the entries were last used in, and how many were. */
   round = 1
   used = 0
@@ -2508,9 +2561,22 @@ export class Lazies {
     fn: Function,
     args: ReadonlyArray<unknown>
   ) => void
+  /** How many lists this render showed. */
+  listsUsed = 0
   begin(): void {
     this.round++
     this.used = 0
+    this.listsUsed = 0
+  }
+  /** Drops the lists this render didn't show. */
+  endLists(): void {
+    const lists = this.lists
+    // A render that showed every list it kept, the usual case, has none to drop.
+    if (lists === undefined || lists.size === this.listsUsed) return
+    const round = this.round
+    lists.forEach((state, render) => {
+      if (state.round !== round) lists.delete(render)
+    })
   }
   /**
    * Drops the entries renders haven't used, such as a removed row's, once
@@ -2541,6 +2607,202 @@ export class Lazies {
   }
 }
 
+interface ListState {
+  items: ReadonlyArray<unknown>
+  selected: unknown
+  nodes: Array<Node<any, any>>
+  /** The index of each key in `items`, made when a selection first changes. */
+  at: Map<unknown, number> | undefined
+  round: number
+}
+
+/**
+ * The arrays `h.list` returns: nodes as `children` would make them, which an
+ * element takes as they are, so a list given again is the same array.
+ */
+const lists = new WeakSet<ReadonlyArray<unknown>>()
+
+/**
+ * How an array `h.list` returned differs from the one it returned before,
+ * `base`, when a runtime patching one in place of the other needs to look at
+ * a few of its nodes only: the indexes in `changed`, the two being of one
+ * length, or, when `changed` is `undefined`, `removed` nodes taken out at
+ * `start` and `added` new ones put in there, with nothing else changed.
+ *
+ * @internal
+ */
+export interface ListHint {
+  readonly base: ReadonlyArray<unknown>
+  readonly changed: ReadonlyArray<number> | undefined
+  readonly start: number
+  readonly removed: number
+  readonly added: number
+  /**
+   * With `changed` `undefined`, the index of the node that traded places
+   * with the one at `start`, nothing else changed: `removed` and `added`
+   * are 0 then.
+   */
+  readonly traded: number | undefined
+}
+
+const hints = new WeakMap<ReadonlyArray<unknown>, ListHint>()
+
+/**
+ * The hint for `nodes`, taken: a hint holds the array before, which would
+ * hold the one before it through its own hint, so each is read once.
+ *
+ * @internal
+ */
+export const takeListHint = (
+  nodes: ReadonlyArray<unknown>
+): ListHint | undefined => {
+  const hint = hints.get(nodes)
+  if (hint !== undefined) hints.delete(nodes)
+  return hint
+}
+
+const changedHint = (
+  base: ReadonlyArray<unknown>,
+  changed: ReadonlyArray<number>
+): ListHint => ({
+  base,
+  changed,
+  start: 0,
+  removed: 0,
+  added: 0,
+  traded: undefined
+})
+
+/**
+ * `h.list`'s nodes for `items` when they are as many as the last render's,
+ * with the same keys in the same order, and some changed in place: the last
+ * render's nodes with those built again. `undefined` as soon as a key
+ * differs, as when rows move. Only called when the selection didn't change.
+ */
+const inPlaceOf = (
+  state: ListState,
+  items: ReadonlyArray<unknown>,
+  key: (item: unknown) => unknown,
+  selected: unknown,
+  make: (item: unknown, chosen: boolean) => Node<any, any>
+): Array<Node<any, any>> | undefined => {
+  const before = state.items
+  const nodes = state.nodes
+  let out: Array<Node<any, any>> | undefined
+  let changed: Array<number> | undefined
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]
+    if (before[index] === item) continue
+    const itemKey = key(item)
+    if (key(before[index]) !== itemKey) {
+      return out === undefined ? tradedOf(state, items, index) : undefined
+    }
+    ;(out ??= nodes.slice())[index] = make(
+      item,
+      selected !== undefined && itemKey === selected
+    )
+    ;(changed ??= []).push(index)
+  }
+  if (out === undefined) return nodes
+  hints.set(out, changedHint(nodes, changed!))
+  return out
+}
+
+/**
+ * `h.list`'s nodes for `items` when the item at `from`, the first that
+ * differs from the last render's, traded places with one after it, and the
+ * rest are the same values where they were, as when a row moves up or down
+ * one: the last render's nodes with those two traded. `undefined` for any
+ * other change.
+ */
+const tradedOf = (
+  state: ListState,
+  items: ReadonlyArray<unknown>,
+  from: number
+): Array<Node<any, any>> | undefined => {
+  const before = state.items
+  let to = items.length - 1
+  while (to > from && before[to] === items[to]) to--
+  if (to === from || before[from] !== items[to] || before[to] !== items[from]) {
+    return undefined
+  }
+  for (let index = from + 1; index < to; index++) {
+    if (before[index] !== items[index]) return undefined
+  }
+  const nodes = state.nodes
+  const out = nodes.slice()
+  out[from] = nodes[to]!
+  out[to] = nodes[from]!
+  hints.set(out, {
+    base: nodes,
+    changed: undefined,
+    start: from,
+    removed: 0,
+    added: 0,
+    traded: to
+  })
+  return out
+}
+
+/**
+ * `h.list`'s nodes for `items` when they are the last render's items with
+ * some inserted, or some removed, in one place, and the rest the same values
+ * in the same order: the last render's nodes with the new ones put in, or
+ * the old ones taken out. `undefined` for any other change. Only called when
+ * the selection didn't change, so a kept item's node is still right.
+ */
+const spliceOf = (
+  state: ListState,
+  items: ReadonlyArray<unknown>,
+  build: (item: unknown) => Node<any, any>
+): Array<Node<any, any>> | undefined => {
+  const before = state.items
+  const nodes = state.nodes
+  const shorter = Math.min(before.length, items.length)
+  let start = 0
+  while (start < shorter && before[start] === items[start]) start++
+  let kept = 0
+  while (
+    kept < shorter - start &&
+    before[before.length - 1 - kept] === items[items.length - 1 - kept]
+  ) kept++
+  const removed = before.length - start - kept
+  const added = items.length - start - kept
+  if (removed > 0 && added > 0) return undefined
+  if (removed === 0 && added === 0) return nodes
+  // An empty list needs no hint: a runtime removes everything.
+  if (items.length === 0) return []
+  let out: Array<Node<any, any>>
+  if (added === 0) {
+    out = nodes.slice()
+    out.splice(start, removed)
+  } else {
+    out = new Array(items.length)
+    for (let index = 0; index < start; index++) out[index] = nodes[index]!
+    for (let index = start; index < start + added; index++) {
+      out[index] = build(items[index])
+    }
+    for (let index = start + added; index < items.length; index++) {
+      out[index] = nodes[index - added]!
+    }
+  }
+  hints.set(out, {
+    base: nodes,
+    changed: undefined,
+    start,
+    removed,
+    added,
+    traded: undefined
+  })
+  return out
+}
+
+/** Whether `children` can take `input` as its nodes. @internal */
+export const isList = (
+  input: unknown
+): input is ReadonlyArray<Node<any, any>> =>
+  Array.isArray(input) && lists.has(input)
+
 /** @internal */
 export interface LazyEntry {
   fn: Function
@@ -2559,6 +2821,54 @@ export interface LazyEntry {
  */
 export interface LazyStore {
   lazy: unknown
+}
+
+/**
+ * `h.list`'s nodes for `items`, a new array: the node of an item the last
+ * render showed, if it's still selected or not as it was, and a new one for
+ * any other. The two arrays are walked side by side, so items kept in their
+ * order, with some added, removed or changed in place, are matched without
+ * a map.
+ */
+const reuse = (
+  state: ListState,
+  items: ReadonlyArray<unknown>,
+  key: (item: unknown) => unknown,
+  selected: unknown,
+  build: (item: unknown) => Node<any, any>,
+  changed: Array<number> | undefined
+): Array<Node<any, any>> => {
+  const before = state.items
+  const nodes = state.nodes
+  const moved = selected !== state.selected
+  const out: Array<Node<any, any>> = new Array(items.length)
+  let from = 0
+  let byItem: Map<unknown, number> | undefined
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index]
+    let was = -1
+    if (from < before.length && before[from] === item) was = from++
+    else if (from + 1 < before.length && before[from + 1] === item) {
+      was = from + 1
+      from += 2
+    } else if (from < before.length && key(before[from]) === key(item)) {
+      // An item given again changed, in its place: built again.
+      from++
+    } else {
+      if (byItem === undefined) {
+        byItem = new Map()
+        for (let at = 0; at < before.length; at++) byItem.set(before[at], at)
+      }
+      was = byItem.get(item) ?? -1
+    }
+    const node = out[index] = was >= 0 &&
+        (!moved ||
+          (key(item) !== selected && key(item) !== state.selected))
+      ? nodes[was]!
+      : build(item)
+    if (changed !== undefined && node !== nodes[index]) changed.push(index)
+  }
+  return out
 }
 
 const sameArgs = (
@@ -2583,12 +2893,14 @@ export type Running = (name: string, groupKey: string | undefined) => boolean
 const notRunning: Running = () => false
 
 class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
-  readonly props: Props
-  readonly elements: Vocabulary<any> | undefined
-  readonly runningFn: Running
+  // Declared only: a declared field is defined by a function of its own
+  // before the constructor runs, and a view makes a helper on every render.
+  declare readonly props: Props
+  declare readonly elements: Vocabulary<any> | undefined
+  declare readonly runningFn: Running
   /** The instance's path, or the instance, whose path is read only when `id` is called. */
-  readonly at: string | PathSource
-  readonly store: LazyStore | undefined
+  declare readonly at: string | PathSource
+  declare readonly store: LazyStore | undefined
   constructor(
     props: Props,
     elements: Vocabulary<any> | undefined,
@@ -2641,6 +2953,120 @@ class HelperImpl<Msg, Props> implements Helper<Msg, Props> {
     }
     lazies.used++
     return node
+  }
+  list(
+    this: any,
+    items: ReadonlyArray<unknown>,
+    options: {
+      readonly key: (item: any) => unknown
+      readonly selected?: unknown
+    },
+    render: (h: any, item: any, selected: boolean) => Content<Msg, any>
+  ): ReadonlyArray<Node<Msg, any>> {
+    const key = options.key
+    const selected = options.selected
+    // `chosen`: whether the item is the selected one, for a caller that has
+    // its key already.
+    const make = (item: unknown, chosen: boolean) => {
+      const content = render(this, item, chosen)
+      // A template's element is a node already. Told apart by its field, not
+      // its class, so an app without templates doesn't keep the class.
+      const node = (content as TemplateNode)["~t"] !== undefined
+        ? content as TemplateNode
+        : toNode(content)
+      // A row's text would join its neighbours'.
+      if (node._tag === "Text") {
+        throw new Error("h.list: render an element for each item, not text")
+      }
+      return node
+    }
+    const build = (item: unknown) =>
+      make(item, selected !== undefined && key(item) === selected)
+    const store = this.store
+    const lazies = store === undefined
+      ? undefined
+      : (store.lazy ??= new Lazies()) as Lazies
+    const state = lazies?.lists?.get(render)
+    // A list whose render another list of this render took is built whole.
+    if (lazies === undefined || state?.round === lazies.round) {
+      return items.map(build)
+    }
+    // A hint the runtime didn't take is stale now, and would keep the arrays
+    // before it.
+    if (state !== undefined) hints.delete(state.nodes)
+    let nodes: Array<Node<Msg, any>>
+    let at: Map<unknown, number> | undefined
+    if (state === undefined || state.items.length === 0) {
+      nodes = items.map(build)
+    } else if (items === state.items) {
+      at = state.at
+      if (selected === state.selected) nodes = state.nodes
+      else {
+        nodes = state.nodes.slice()
+        if (at === undefined) {
+          at = new Map()
+          for (let index = 0; index < items.length; index++) {
+            at.set(key(items[index]), index)
+          }
+        }
+        const changed: Array<number> = []
+        if (at.size === items.length) {
+          for (const named of [state.selected, selected]) {
+            const index = named === undefined ? undefined : at.get(named)
+            if (index !== undefined) {
+              nodes[index] = build(items[index])
+              changed.push(index)
+            }
+          }
+        } else {
+          // Keys repeat, and the map holds the last item of each: every item
+          // with either key gains or loses the selection.
+          for (let index = 0; index < items.length; index++) {
+            const named = key(items[index])
+            if (
+              named !== undefined &&
+              (named === state.selected || named === selected)
+            ) {
+              nodes[index] = build(items[index])
+              changed.push(index)
+            }
+          }
+        }
+        hints.set(nodes, changedHint(state.nodes, changed))
+      }
+    } else {
+      const spliced = selected !== state.selected
+        ? undefined
+        : items.length === state.items.length
+        ? inPlaceOf(state, items, key, selected, make)
+        : spliceOf(state, items, build)
+      if (spliced !== undefined) nodes = spliced
+      else {
+        const changed = items.length === state.nodes.length ? [] : undefined
+        nodes = reuse(state, items, key, selected, build, changed)
+        if (changed !== undefined) {
+          hints.set(nodes, changedHint(state.nodes, changed))
+        }
+      }
+    }
+    if (state === undefined) {
+      ;(lazies.lists ??= new Map()).set(render, {
+        items,
+        selected,
+        nodes,
+        at,
+        round: lazies.round
+      })
+    } else {
+      state.items = items
+      state.selected = selected
+      state.nodes = nodes
+      state.at = at
+      state.round = lazies.round
+    }
+    lazies.listsUsed++
+    lists.add(nodes)
+    return nodes
   }
   keepAlive(this: any, alive: any, content?: any): unknown {
     const s = Object.create(this)
@@ -2809,3 +3235,539 @@ export const slotNodes = <Msg>(
   }
   return out
 }
+
+/**
+ * Turns a view of rows that differ only in a few values into one built once:
+ * `build` writes the element with the given helper as any view does, and
+ * reads the values that change from `slots`. The result is a function from
+ * those values to the element, which costs one small object per call where
+ * a view built with the helper costs one or more per element and chain call.
+ *
+ * **Details**
+ *
+ * `build` runs once, with each slot read as a placeholder. A slot may be the
+ * whole value of an attribute, the whole text of a child, a handler, or the
+ * key of the root: `h.tr.key($.key).class($.selected).children(h.td($.label))`.
+ * A slot used inside a larger value, as in `"Hi " + $.name` or
+ * `class("row", $.state)`, throws, as do components, slots of the
+ * component, properties, mounts, refs and the parts of headless components
+ * in the element: put those in the view around it. Another template may be
+ * used in `build`, with this one's slots or fixed values as its values: it
+ * becomes part of this one.
+ *
+ * A text slot takes a string. An attribute slot takes a string, or
+ * `undefined`, `null` or `false` to leave the attribute out. A handler slot
+ * takes what `on` does. A slot that is an element's only child, as in
+ * `h.tbody.children($.rows)`, also takes an array of nodes, such as a list
+ * `h.list` returns, which the element holds: the layout around a list can be
+ * a template, and a render patches only the list.
+ *
+ * The browser host renders a template made with `Html.template` by copying
+ * the nodes it built for the first one and writing the slots, and patches
+ * one by comparing its slots with the last render's: the code for that
+ * comes with `Html.template`, so an app that makes no template doesn't ship
+ * it. A template made with this function, and anything else that reads the
+ * element, such as the server renderer, hydration or a test host, sees the
+ * same element a view built with the helper would.
+ *
+ * @stability experimental
+ * @category constructors
+ * @since 0.1.0
+ */
+export const template = <Values extends Record<string, unknown>, H>(
+  helper: H,
+  build: (h: H, slots: Values) => Content<any, any>
+): (values: Values) => Element<any, Requirements<Values[keyof Values]>> =>
+  makeTemplate(helper, build, undefined)
+
+/**
+ * `template`, with the operations a host that copies nodes renders it with,
+ * as `Html.template` gives them. Without them, every host builds the
+ * template's element as it builds any other.
+ *
+ * @internal
+ */
+export const makeTemplate = <Values extends Record<string, unknown>, H>(
+  helper: H,
+  build: (h: H, slots: Values) => Content<any, any>,
+  kernel: TemplateKernel | undefined
+): (values: Values) => Element<any, Requirements<Values[keyof Values]>> => {
+  const def = defineTemplate(
+    toNode(build(helper, slotProxy as Values)),
+    kernel
+  )
+  return (values) => new TemplateNode(def, values)
+}
+
+/**
+ * How a host that copies nodes renders a template's elements: `create`
+ * builds one, returning its record, and `patch` patches one record made by
+ * `create` to the template's next element. Kept on the template, so the
+ * kernel only reaches them through a template that has them.
+ *
+ * @internal
+ */
+export interface TemplateKernel {
+  readonly create: (inst: unknown, view: TemplateNode) => unknown
+  readonly patch: (
+    inst: unknown,
+    rec: unknown,
+    prev: TemplateNode,
+    view: TemplateNode
+  ) => void
+}
+
+const slotMark = "\u0000@effect/ui/View/slot\u0000"
+// Ends a slot's placeholder, so that one with text after it, as in
+// `$.name + "!"`, is no slot's name but a slot inside a larger value.
+const slotEnd = "\u0000"
+
+const slotProxy = new Proxy({}, {
+  get: (_, name) =>
+    typeof name === "string" ? slotMark + name + slotEnd : undefined
+})
+
+const slotOf = (value: unknown): string | undefined => {
+  if (
+    typeof value !== "string" || !value.startsWith(slotMark) ||
+    !value.endsWith(slotEnd)
+  ) return undefined
+  const name = value.slice(slotMark.length, -slotEnd.length)
+  return name.includes(slotEnd) ? undefined : name
+}
+
+const noSlot = (value: unknown, where: string): void => {
+  if (typeof value === "string" && value.includes(slotMark)) {
+    throw new Error(
+      `View.template: a slot is ${where} with other text; give it the whole value`
+    )
+  }
+}
+
+/**
+ * A slot of a template: where its value goes, as the index of the point that
+ * holds it, and how it's written.
+ *
+ * @internal
+ */
+export interface TemplateHole {
+  readonly point: number
+  /**
+   * `"content"` for a slot that is its element's only child: it takes text,
+   * written as a `"text"` slot's is, or an array of nodes, which the element
+   * holds instead.
+   */
+  readonly kind: "text" | "attr" | "content"
+  /** The attribute's name. */
+  readonly name: string
+  readonly slot: string
+  /** A content slot's element, as the number of its node. */
+  readonly owner: number
+  /** A content slot's place among the template's content slots. */
+  readonly index: number
+}
+
+/**
+ * What an element of a template that has handlers dispatches through, in
+ * place of a record, the same for every element the template makes: a host
+ * reads a slot's handler off the values of the element it's in, the
+ * nearest one up whose record a host marked as a template's.
+ *
+ * @internal
+ */
+export interface TemplateTarget {
+  readonly v: TemplateTarget
+  /** Each event's handler, or for a slot's the slot's name. */
+  readonly handlers: Readonly<Record<string, unknown>>
+  readonly eventOptions: Readonly<Record<string, EventOptions>>
+  /** The slot of each event whose handler is one. */
+  readonly slots: Readonly<Record<string, string>>
+}
+
+/**
+ * What `template` makes once: the element with placeholders, the paths to the
+ * nodes the slots write, its slots by kind, and the element the host builds
+ * its nodes from. A handler's slot is read off the values when its event
+ * comes, so it has no hole.
+ *
+ * @internal
+ */
+export interface TemplateDef {
+  readonly root: Element<any, any>
+  readonly keySlot: string | undefined
+  /**
+   * How to reach the nodes the slots write, from a copy's root: step `i`
+   * reads node `i + 1`, the first child (`next[i]` 0) or the next sibling (1)
+   * of node `from[i]`. Node 0 is the root. A hole's `point`, and a handled
+   * element's, is the number of its node.
+   */
+  readonly walk: {
+    readonly from: ReadonlyArray<number>
+    readonly next: ReadonlyArray<number>
+  }
+  /** The text slots, the attribute slots and the content slots: what a render writes. */
+  readonly texts: ReadonlyArray<TemplateHole>
+  readonly attrs: ReadonlyArray<TemplateHole>
+  readonly contents: ReadonlyArray<TemplateHole>
+  /** Whether the root has children, which its record makes when patched. */
+  readonly parent: boolean
+  /** How far below the root its deepest element with handlers is. */
+  readonly depth: number
+  /** For each point that is an element with handlers, its static handlers and options. */
+  readonly handled: ReadonlyArray<
+    {
+      /**
+       * The number of the element's node, as a hole's `point`: a host finds
+       * which element an event came from by the node, not by where it is, as
+       * a node something else put in the row would move it.
+       */
+      readonly point: number
+      readonly target: TemplateTarget
+    }
+  >
+  /** The element without its slots: no handlers, slot attributes left out and slot text a space. */
+  readonly blank: Element<any, any>
+  /** The operations a host that copies nodes renders the template with. */
+  readonly kernel: TemplateKernel | undefined
+}
+
+const defineTemplate = (
+  root: Node<any, any>,
+  kernel: TemplateKernel | undefined
+): TemplateDef => {
+  if (root._tag !== "Element") {
+    throw new Error("View.template: build an element")
+  }
+  const points: Array<ReadonlyArray<number>> = []
+  const holes: Array<TemplateHole> = []
+  const handled: Array<TemplateDef["handled"][number]> = []
+  let keySlot: string | undefined
+  let contents = 0
+  let depth = 0
+  const pointOf = (path: ReadonlyArray<number>): number => {
+    const last = points[points.length - 1]
+    if (last !== undefined && last.join() === path.join()) {
+      return points.length - 1
+    }
+    points.push(path)
+    return points.length - 1
+  }
+  const visit = (
+    view: Node<any, any>,
+    path: ReadonlyArray<number>
+  ): Node<any, any> => {
+    // A template built inside this one is its element, with this one's slots
+    // in its own.
+    const node = asElement(view)
+    if (node._tag === "Text") {
+      const slot = slotOf(node.text)
+      if (slot === undefined) {
+        noSlot(node.text, "in a text")
+        return node
+      }
+      holes.push({
+        point: pointOf(path),
+        kind: "text",
+        name: "",
+        slot,
+        owner: -1,
+        index: -1
+      })
+      // A placeholder the copy holds, which every render writes.
+      return text(" ")
+    }
+    if (node._tag !== "Element") {
+      throw new Error(
+        `View.template: a template holds elements and text, not a ${node._tag}`
+      )
+    }
+    if (!isPlain(node) || !isPlainTag(node.tag)) {
+      throw new Error(
+        `View.template: <${node.tag}> holds properties, a mount, a ref or a part, or is a form, a script or a custom element; put it in the view around the template`
+      )
+    }
+    const key = slotOf(node.elementKey)
+    if (key !== undefined) {
+      if (path.length > 0) {
+        throw new Error("View.template: only the root's key can be a slot")
+      }
+      keySlot = key
+    } else noSlot(node.elementKey, "in a key")
+    let attrs: Record<string, string> | undefined
+    for (const name in node.attrs) {
+      const value = node.attrs[name]!
+      const slot = slotOf(value)
+      if (slot === undefined) {
+        noSlot(value, `in the attribute ${name}`)
+        continue
+      }
+      holes.push({
+        point: pointOf(path),
+        kind: "attr",
+        name,
+        slot,
+        owner: -1,
+        index: -1
+      })
+      attrs ??= { ...node.attrs }
+      delete attrs[name]
+    }
+    if (node.handlers !== noFields || node.eventOptions !== noFields) {
+      const handlers: Record<string, unknown> = {}
+      const slots: Record<string, string> = {}
+      for (const name in node.handlers) {
+        const slot = slotOf(node.handlers[name])
+        if (slot === undefined) handlers[name] = node.handlers[name]
+        else {
+          handlers[name] = slot
+          slots[name] = slot
+        }
+      }
+      const target: Mutable<TemplateTarget> = {
+        v: undefined!,
+        handlers,
+        eventOptions: node.eventOptions,
+        slots
+      }
+      target.v = target
+      handled.push({ point: pointOf(path), target })
+      if (path.length > depth) depth = path.length
+    }
+    const content = contentSlotOf(node)
+    let children: ReadonlyArray<Node<any, any>>
+    if (content !== undefined) {
+      const owner = pointOf(path)
+      holes.push({
+        point: pointOf([...path, 0]),
+        kind: "content",
+        name: "",
+        slot: content,
+        owner,
+        index: contents++
+      })
+      children = [text(" ")]
+    } else {
+      children = node.children.map((child, index) =>
+        visit(child, [...path, index])
+      )
+    }
+    return {
+      ...node,
+      elementKey: undefined,
+      attrs: attrs === undefined
+        ? node.attrs
+        : Object.keys(attrs).length === 0
+        ? noFields
+        : attrs,
+      handlers: noFields,
+      eventOptions: noFields,
+      children
+    }
+  }
+  const blank = visit(root, []) as Element<any, any>
+  // Each path picks up from the node of the one before at the depth they
+  // share, so every node on the way is read once.
+  const from: Array<number> = []
+  const next: Array<number> = []
+  const at: Array<number> = []
+  const trail: Array<number> = [0]
+  points.forEach((path, index) => {
+    const before = points[index - 1]
+    let common = 0
+    if (before !== undefined) {
+      const length = Math.min(path.length, before.length)
+      while (common < length && before[common] === path[common]) common++
+    }
+    for (let depth = common; depth < path.length; depth++) {
+      let node: number
+      let child: number
+      if (depth === common && before !== undefined && before.length > depth) {
+        node = trail[depth + 1]!
+        child = before[depth]!
+      } else {
+        from.push(trail[depth]!)
+        next.push(0)
+        node = from.length
+        child = 0
+      }
+      for (; child < path[depth]!; child++) {
+        from.push(node)
+        next.push(1)
+        node = from.length
+      }
+      trail[depth + 1] = node
+    }
+    at.push(trail[path.length]!)
+  })
+  const placed = holes.map((hole) => ({
+    ...hole,
+    point: at[hole.point]!,
+    owner: hole.owner < 0 ? -1 : at[hole.owner]!
+  }))
+  return {
+    root,
+    keySlot,
+    walk: { from, next },
+    texts: placed.filter((hole) => hole.kind === "text"),
+    attrs: placed.filter((hole) => hole.kind === "attr"),
+    contents: placed.filter((hole) => hole.kind === "content"),
+    parent: root.children.length > 0,
+    depth,
+    handled: handled.map((entry) => ({ ...entry, point: at[entry.point]! })),
+    blank,
+    kernel
+  }
+}
+
+/**
+ * The element a template made for one set of values. The kernel renders it
+ * from `~t` and `values`; anything else reads its fields, which are the
+ * template's element with the values in its slots, made when first read.
+ *
+ * @internal
+ */
+export class TemplateNode implements Element<any, never> {
+  // Declared and set in the constructor: a field with a value, or one only
+  // declared, would be defined by a function of its own before the
+  // constructor runs, for every row a list renders.
+  declare readonly _tag: "Element"
+  declare readonly tag: string
+  declare readonly elementKey: string | undefined
+  declare readonly "~t": TemplateDef
+  declare readonly values: Readonly<Record<string, unknown>>
+  declare private made: Element<any, never> | undefined
+  constructor(def: TemplateDef, values: Readonly<Record<string, unknown>>) {
+    this._tag = "Element"
+    this.tag = def.root.tag
+    this.elementKey = def.keySlot === undefined
+      ? def.root.elementKey
+      : values[def.keySlot] as string | undefined
+    this["~t"] = def
+    this.values = values
+    this.made = undefined
+  }
+  get attrs(): Readonly<Record<string, string>> {
+    return this.element().attrs
+  }
+  get props(): Readonly<Record<string, unknown>> {
+    return noFields
+  }
+  get handlers(): Readonly<Record<string, Handler<any, any>>> {
+    return this.element().handlers
+  }
+  get eventOptions(): Readonly<Record<string, EventOptions>> {
+    return this["~t"].root.eventOptions
+  }
+  get refKey(): undefined {
+    return undefined
+  }
+  get mount(): undefined {
+    return undefined
+  }
+  get owned(): ReadonlyArray<Owned> {
+    return noOwned
+  }
+  get children(): ReadonlyArray<Node<any, never>> {
+    return this.element().children
+  }
+  /** The template's element with this node's values in its slots. */
+  element(): Element<any, never> {
+    return this.made ??= fillSlots(this["~t"].root, this.values) as Element<
+      any,
+      never
+    >
+  }
+}
+
+/**
+ * A slot's value as given: `undefined`, `null` and `false` leave it out, so
+ * an attribute slot holding one has no attribute, and a text slot is empty.
+ *
+ * @internal
+ */
+export const slotValue = (value: unknown): unknown =>
+  value === undefined || value === null || value === false ? undefined : value
+
+/**
+ * The text a text or content slot holding `value`, not an array, shows.
+ *
+ * @internal
+ */
+export const slotText = (value: unknown): string =>
+  typeof value === "string" ? value : String(slotValue(value) ?? "")
+
+/**
+ * The nodes a content slot holding an array shows: a list `h.list` gave as
+ * it is, which keeps what it says about how it changed, and any other array
+ * as `children` takes it.
+ *
+ * @internal
+ */
+export const nodesIn = (
+  value: ReadonlyArray<unknown>
+): ReadonlyArray<Node<any, any>> =>
+  isList(value) ? value : children(value as never)
+
+// The slot of a template's element whose only child is a slot: its content.
+const contentSlotOf = (node: Element<any, any>): string | undefined => {
+  const only = node.children.length === 1 ? node.children[0]! : undefined
+  return only?._tag === "Text" ? slotOf(only.text) : undefined
+}
+
+const fillSlots = (
+  view: Node<any, any>,
+  values: Readonly<Record<string, unknown>>
+): Node<any, any> => {
+  // A template built inside this one: its element, whose slots are this
+  // one's, as a spread of the template's node would drop its fields.
+  const node = asElement(view)
+  if (node._tag === "Text") {
+    const slot = slotOf(node.text)
+    return slot === undefined ? node : text(slotText(values[slot]))
+  }
+  if (node._tag !== "Element") return node
+  let attrs: Record<string, string> | undefined
+  for (const name in node.attrs) {
+    const slot = slotOf(node.attrs[name])
+    if (slot === undefined) continue
+    attrs ??= { ...node.attrs }
+    const value = slotValue(values[slot])
+    if (value === undefined) delete attrs[name]
+    else attrs[name] = String(value)
+  }
+  let handlers: Record<string, Handler<any, any>> | undefined
+  for (const name in node.handlers) {
+    const slot = slotOf(node.handlers[name])
+    if (slot === undefined) continue
+    handlers ??= { ...node.handlers }
+    const value = values[slot]
+    if (value === undefined) delete handlers[name]
+    else handlers[name] = value as Handler<any, any>
+  }
+  const key = slotOf(node.elementKey)
+  // A content slot holding an array: its nodes are the children.
+  const content = contentSlotOf(node)
+  const nodes = content === undefined ? undefined : values[content]
+  return {
+    ...node,
+    elementKey: key === undefined
+      ? node.elementKey
+      : values[key] as string | undefined,
+    attrs: attrs ?? node.attrs,
+    handlers: handlers ?? node.handlers,
+    children: Array.isArray(nodes)
+      ? nodesIn(nodes)
+      : node.children.map((child) => fillSlots(child, values))
+  }
+}
+
+/**
+ * `node` as a plain element: a template's made with its values, any other
+ * node as it is. For code that copies a node with a spread.
+ *
+ * @internal
+ */
+export const asElement = <N extends Node<any, any>>(node: N): N =>
+  (node as unknown as TemplateNode)["~t"] !== undefined
+    ? (node as unknown as TemplateNode).element() as unknown as N
+    : node

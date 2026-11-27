@@ -1,0 +1,16 @@
+{
+  "framework": "effect-ui-v0.0.0-6413803-keyed",
+  "keyed": true,
+  "benchmark": "25_run-clear-memory",
+  "type": "memory",
+  "values": {
+    "DEFAULT": {
+      "min": 1.650655746459961,
+      "max": 1.650655746459961,
+      "median": 1.650655746459961,
+      "mean": 1.650655746459961,
+      "stddev": null,
+      "values": [1.650655746459961]
+    }
+  }
+}

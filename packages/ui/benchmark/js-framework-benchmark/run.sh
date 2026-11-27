@@ -2,14 +2,16 @@
 # Runs krausest/js-framework-benchmark for Effect UI (built from this checkout), Foldkit, React, Vue,
 # Svelte, Solid and vanilla JS. See README.md.
 #
-# Run from the repository root, inside `nix develop`:
+# Run from the repository root, inside `nix develop` or on macOS:
 #
 #   packages/ui/benchmark/js-framework-benchmark/run.sh <dir> [--count <n>] [--benchmark <prefix>...]
 #
 # <dir> is where the harness is cloned, outside the repository. The browser is $CHROMIUM, else
-# `chromium` on PATH. REVERSE=1 runs the frameworks in reverse order. Extra arguments go to each of
-# the harness's `npm run bench`. Results and load.txt are written to <dir>/webdriver-ts/results and
-# summarized by summarize.mjs.
+# `chromium` on PATH. REVERSE=1 runs the frameworks in reverse order. INTERLEAVE=1 runs the
+# harness's default benchmarks, or those given with --benchmark, one at a time, each for every
+# framework in turn, alternating the order. Extra arguments go to each of the harness's
+# `npm run bench`. Results and load.txt are written to <dir>/webdriver-ts/results and summarized
+# by summarize.mjs.
 set -euo pipefail
 
 HARNESS_REV=0f4e78932bf85ed60b163b801bbdbd720fdda54f
@@ -59,22 +61,71 @@ for f in "${FRAMEWORKS[@]}"; do
   (cd "frameworks/keyed/$f" && if [ "$f" = effect-ui ]; then npm install; else npm ci; fi && npm run build-prod)
 done
 
-# In its own process group, so that stopping it stops npm's children too.
-setsid bash -c 'cd server && exec npm start' &
+# In its own process group, so that stopping it stops npm's children too. Job control gives a
+# background job a group of its own, where Linux's setsid would but macOS has none.
+set -m
+(cd server && exec npm start) &
 server=$!
+set +m
 trap 'kill -- -$server' EXIT
 until curl -sf localhost:8080/ls > /dev/null; do sleep 1; done
 
 cd webdriver-ts
 npm run isKeyed -- --headless --chromeBinary "$chromium" "${FRAMEWORKS[@]/#/keyed/}"
 rm -rf results && mkdir results
-order=("${FRAMEWORKS[@]}")
-if [ "${REVERSE:-}" = 1 ]; then mapfile -t order < <(printf '%s\n' "${FRAMEWORKS[@]}" | tac); fi
-load() { echo "$1 $(date -u +%FT%TZ) $(cut -d' ' -f1-3 /proc/loadavg)" >> results/load.txt; }
-# One framework at a time: given several, the harness sorts them by name.
-for f in "${order[@]}"; do
-  load "$f start"
-  npm run bench -- --headless --chromeBinary "$chromium" "$@" --framework "keyed/$f"
-done
+# Without mapfile or tac, which macOS's bash 3.2 and BSD tools lack.
+backward=()
+for ((i = ${#FRAMEWORKS[@]} - 1; i >= 0; i--)); do backward+=("${FRAMEWORKS[$i]}"); done
+if [ "${REVERSE:-}" = 1 ]; then
+  order=("${backward[@]}")
+  against=("${FRAMEWORKS[@]}")
+else
+  order=("${FRAMEWORKS[@]}")
+  against=("${backward[@]}")
+fi
+loadavg() {
+  if [ -r /proc/loadavg ]; then cut -d' ' -f1-3 /proc/loadavg; else sysctl -n vm.loadavg | tr -d '{}' | xargs; fi
+}
+load() { echo "$1 $(date -u +%FT%TZ) $(loadavg)" >> results/load.txt; }
+bench() { npm run bench -- --headless --chromeBinary "$chromium" "$@"; }
+if [ "${INTERLEAVE:-}" = 1 ]; then
+  # The prefixes given with --benchmark are run one at a time, and the other arguments go to every
+  # run: passed on as well, they'd select those benchmarks in every run, which would write over
+  # each other's results.
+  benchmarks=()
+  rest=()
+  taking=0
+  for arg in "$@"; do
+    case "$arg" in
+      --benchmark) taking=1 ;;
+      --benchmark=*) benchmarks+=("${arg#--benchmark=}") ;;
+      --*) taking=0; rest+=("$arg") ;;
+      *) if [ "$taking" = 1 ]; then benchmarks+=("$arg"); else rest+=("$arg"); fi ;;
+    esac
+  done
+  # Else the harness's default benchmarks; 40_ is the one that measures sizes and first paint.
+  if [ ${#benchmarks[@]} -eq 0 ]; then
+    benchmarks=(01_ 02_ 03_ 04_ 05_ 06_ 07_ 08_ 09_ 21_ 22_ 25_ 40_)
+  fi
+  # Benchmark by benchmark, every framework in turn, the order reversed from one benchmark to the
+  # next: a busy stretch of a shared machine then falls on every framework's runs of a benchmark
+  # within minutes, not on one framework's whole run. `${rest[@]+...}`: bash 3.2 takes an empty
+  # array as unset.
+  turn=0
+  for b in "${benchmarks[@]}"; do
+    if ((turn % 2 == 0)); then frameworks=("${order[@]}"); else frameworks=("${against[@]}"); fi
+    for f in "${frameworks[@]}"; do
+      load "$f $b start"
+      bench ${rest[@]+"${rest[@]}"} --benchmark "$b" --framework "keyed/$f"
+    done
+    turn=$((turn + 1))
+  done
+else
+  # One framework at a time: given several, the harness sorts them by name.
+  for f in "${order[@]}"; do
+    load "$f start"
+    bench "$@" --framework "keyed/$f"
+  done
+fi
 load end
 node "$here/summarize.mjs" results

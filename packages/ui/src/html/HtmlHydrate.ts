@@ -396,6 +396,7 @@ const between = (
     ...base,
     // Adopting nodes, it creates each one.
     clone: undefined,
+    pointsOf: undefined,
     createElement(tag) {
       const node = take(tag)
       if (node === null) {

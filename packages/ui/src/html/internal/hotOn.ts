@@ -9,6 +9,7 @@ import { rootPath } from "../../internal/paths.ts"
 import type * as runtime from "../../internal/runtime.ts"
 import { forgetStateCodec } from "../../internal/stateCodec.ts"
 import * as stateRestore from "../../internal/stateRestore.ts"
+import * as templates from "../../internal/templates.ts"
 import type * as MessageLog from "../../MessageLog.ts"
 import type * as View from "../../View.ts"
 import type * as BrowserHost from "../BrowserHost.ts"
@@ -294,9 +295,15 @@ const reuses = (
   if (old._tag !== "Element" || !holdsChild(rec)) return true
   const next = view as View.Element<any, any>
   if (old.owned?.length || next.owned?.length) return false
+  // A template's element, as the browser host made it, holds a record for
+  // each content slot, holding the slot's nodes. `pairs` has checked that
+  // `next` is the same template's.
+  const views = rec.points !== undefined
+    ? templates.kidViews(next as View.TemplateNode)
+    : next.children
   const kids = rec.kids!
-  return kids.length === next.children.length &&
-    kids.every((kid, index) => reuses(kid, next.children[index]!, resolve))
+  return kids.length === views.length &&
+    kids.every((kid, index) => reuses(kid, views[index]!, resolve))
 }
 
 // Reload if a child would remount, including when its component identity or

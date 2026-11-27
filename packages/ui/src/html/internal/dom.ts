@@ -122,6 +122,7 @@ const ignore = () => {}
 
 type Node = globalThis.Node & {
   $r?: Kernel.Rec
+  $t?: Kernel.Rec
   moveBefore?: ParentNode["moveBefore"]
 }
 
@@ -134,6 +135,25 @@ interface HostOptions {
   readonly head?: boolean | undefined
   readonly warn: (message: string) => void
   readonly step?: ((f: () => boolean) => boolean) | undefined
+}
+
+/**
+ * The nodes of a template's copy `walk` reaches, with the root first, read
+ * with the DOM's own properties.
+ */
+const pointsOf = (
+  root: globalThis.Node,
+  walk: View.TemplateDef["walk"]
+): Array<globalThis.Node> => {
+  const from = walk.from
+  const next = walk.next
+  const nodes: Array<globalThis.Node> = new Array(from.length + 1)
+  nodes[0] = root
+  for (let step = 0; step < from.length; step++) {
+    const node = nodes[from[step]!]!
+    nodes[step + 1] = next[step] === 0 ? node.firstChild! : node.nextSibling!
+  }
+  return nodes
 }
 
 /** @internal */
@@ -359,8 +379,75 @@ export const makeHost = (
     restore.add(target)
   }
 
+  // The deepest a template's element with handlers is below its root, of
+  // the templates this host rendered: -1 until it renders one. A node with
+  // handlers in a template is at most that far below its row, so `rowOf`
+  // walks no further, and not at all in a page without templates.
+  let templateDepth = -1
+
+  // The element a template made that `node` is in, by its marked root, if
+  // `node` is one of its own nodes: one without a record.
+  const rowOf = (node: globalThis.Node): Kernel.Rec | undefined => {
+    let at: Node | null = node as Node
+    for (let up = 0; up <= templateDepth; up++) {
+      if (at === null || at === container) return undefined
+      if (at.$t !== undefined) return at.$t
+      if (at.$r !== undefined) return undefined
+      at = at.parentNode as Node | null
+    }
+    return undefined
+  }
+
+  // The row `targetOf` found its target in, if it was a template's.
+  let foundRow: Kernel.Rec | undefined
+
+  // What `node` dispatches through: its record, or for an element of a
+  // template, the template's target for it, read off the row's points.
+  const targetOf = (node: globalThis.Node): Kernel.Rec | undefined => {
+    foundRow = undefined
+    const rec = (node as Node).$r
+    if (rec !== undefined || templateDepth < 0) return rec
+    const row = rowOf(node)
+    const points = row?.points
+    if (points === undefined) return undefined
+    // Found by the node itself, which the row's points hold, not by where it
+    // is: a node something else put in the row, such as a translator's or an
+    // extension's, moves the ones after it. A node inside an element with
+    // handlers, such as the icon in a link, matches none, and its event
+    // passes on to that element.
+    const handled = (row!.v as View.TemplateNode)["~t"].handled
+    for (let index = 0; index < handled.length; index++) {
+      if (points[handled[index]!.point] === node) {
+        foundRow = row
+        return handled[index]!.target as never
+      }
+    }
+    return undefined
+  }
+
   const elementOf = (node: globalThis.Node) =>
-    (node as Node).$r?.v as View.Element<any, any> | undefined
+    targetOf(node)?.v as View.Element<any, any> | undefined
+
+  // The handler for `name` of `rec`, a target `targetOf` found in `row`: its
+  // element's, or for an element of a template whose handler is a slot, the
+  // row's value for the slot. Only `undefined` is no handler: `null` and
+  // `false` are messages, as they are to `on`.
+  const handlerIn = (
+    rec: Kernel.Rec | undefined,
+    row: Kernel.Rec | undefined,
+    name: string
+  ): View.Handler<any, any> | undefined => {
+    const handler = (rec?.v as View.Element<any, any> | undefined)
+      ?.handlers[name]
+    if (handler === undefined || row === undefined) return handler
+    const slot = (rec as unknown as View.TemplateTarget).slots[name]
+    return slot === undefined
+      ? handler
+      : (row.v as View.TemplateNode).values[slot] as View.Handler<any, any>
+  }
+
+  const handlerOf = (node: globalThis.Node, name: string) =>
+    handlerIn(targetOf(node), foundRow, name)
 
   /** Applies a sending handler's options to its event. */
   const sent = (
@@ -385,13 +472,14 @@ export const makeHost = (
     payload: () => unknown,
     event?: Event
   ): boolean => {
-    const rec = (node as Node).$r
-    const element = rec?.v as View.Element<any, any> | undefined
-    const handler = element?.handlers[name]
+    const rec = targetOf(node)
+    const row = foundRow
+    const handler = handlerIn(rec, row, name)
     if (handler === undefined) return false
-    const options = element!.eventOptions[name]
+    // A template's target sends to the row's instance.
+    const inst = (row ?? rec!).inst
+    const options = (rec!.v as View.Element<any, any>).eventOptions[name]
     if (options?.preventDefault === "always") event?.preventDefault()
-    const inst = rec!.inst
     step(() => {
       if (inst.closed) return false
       if (handler?.["~fire"] !== undefined) {
@@ -438,7 +526,7 @@ export const makeHost = (
   const queueMove = (event: PointerEvent, path: ReadonlyArray<Node>) => {
     for (const node of path) {
       if (node === container) return
-      if (elementOf(node)?.handlers.pointermove === undefined) continue
+      if (handlerOf(node, "pointermove") === undefined) continue
       if (moves === undefined) {
         const queued = moves = new Map()
         later(() => {
@@ -468,10 +556,14 @@ export const makeHost = (
   }
 
   const accepts = (node: globalThis.Node, types: ReadonlyArray<string>) => {
-    const element = elementOf(node)
-    return element?.handlers.drop !== undefined &&
-      (element.eventOptions.drop as Html.DropTargetOptions | undefined)?.accepts
-          ?.some((type) => types.includes(type.toLowerCase())) === true
+    const rec = targetOf(node)
+    if (handlerIn(rec, foundRow, "drop") === undefined) return false
+    const options = (rec!.v as View.Element<any, any>).eventOptions.drop as
+      | Html.DropTargetOptions
+      | undefined
+    return options?.accepts?.some((type) =>
+      types.includes(type.toLowerCase())
+    ) === true
   }
 
   const dropTargetOf = (event: DragEvent, path: ReadonlyArray<Node>) => {
@@ -498,7 +590,7 @@ export const makeHost = (
   }
 
   const queueOver = (element: globalThis.Element, event: DragEvent) => {
-    if (elementOf(element)?.handlers.dragover === undefined) return
+    if (handlerOf(element, "dragover") === undefined) return
     over = [element, boxOf(event, element), typesOf(event)]
     if (overFrame) return
     overFrame = true
@@ -935,14 +1027,24 @@ export const makeHost = (
     kindOf: (node) =>
       node.nodeType === 3 ? "#text" : (node as globalThis.Element).localName,
     recOf: (node) => (node as Node).$r,
+    pointsOf,
+    row(node, record) {
+      ;(node as Node).$t = record
+      const depth = (record.v as View.TemplateNode)["~t"].depth
+      if (depth > templateDepth) templateDepth = depth
+    },
     createContainer: () => document.createDocumentFragment(),
     controlled,
     runsMounts: true,
+    // Runs after every render: each set is walked only when it holds
+    // something, as `for...of` makes an iterator even for an empty one.
     commit() {
-      for (const dialog of shown) {
-        if (dialog.open && dialog.isConnected) continue
-        unmodal(dialog)
-        shown.delete(dialog)
+      if (shown.size > 0) {
+        for (const dialog of shown) {
+          if (dialog.open && dialog.isConnected) continue
+          unmodal(dialog)
+          shown.delete(dialog)
+        }
       }
       if (modalWanted.size > 0) {
         for (const dialog of inOrder([...modalWanted])) {
@@ -950,11 +1052,13 @@ export const makeHost = (
           else if (!held) showDialog(dialog, "modal")
         }
       }
-      for (const element of manualPopovers) {
-        if (!element.isConnected) manualPopovers.delete(element)
-        else if (written.get(element)?.get("popoverOpen") === true) {
-          popoversToShow.add(element)
-        } else applyPopover(element, false)
+      if (manualPopovers.size > 0) {
+        for (const element of manualPopovers) {
+          if (!element.isConnected) manualPopovers.delete(element)
+          else if (written.get(element)?.get("popoverOpen") === true) {
+            popoversToShow.add(element)
+          } else applyPopover(element, false)
+        }
       }
       if (popoversToShow.size > 0) {
         const popovers = inOrder([...popoversToShow])
@@ -998,6 +1102,7 @@ export const makeHost = (
       sync?.release()
       for (const node of container.querySelectorAll("*")) {
         delete (node as Node).$r
+        delete (node as Node).$t
       }
       for (const name of listening) {
         container.removeEventListener(name, listener, true)

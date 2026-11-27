@@ -1,0 +1,16 @@
+{
+  "framework": "solid-v1.9.3-keyed",
+  "keyed": true,
+  "benchmark": "43_first-paint",
+  "type": "size",
+  "values": {
+    "DEFAULT": {
+      "min": 53,
+      "max": 53,
+      "median": 53,
+      "mean": 53,
+      "stddev": null,
+      "values": [53]
+    }
+  }
+}

@@ -148,6 +148,7 @@ import * as Schema from "effect/Schema"
 import type * as Types from "effect/Types"
 import * as Component from "../Component.ts"
 import { handle } from "../internal/handler.ts"
+import * as Templates from "../internal/templates.ts"
 import * as Renderer from "../Renderer.ts"
 import * as View from "../View.ts"
 import type * as HtmlHead from "./HtmlHead.ts"
@@ -1337,11 +1338,38 @@ export type Style =
 export const classNames = (...tokens: ReadonlyArray<ClassToken>): string =>
   joinClassTokens(tokens)
 
+// The last tokens joined after each first token, and what they made: a view
+// gives the same class list on every render, and joining it again would make
+// a new string, which the attribute record shared per class then hashes.
+interface Joined {
+  tokens: ReadonlyArray<ClassToken>
+  value: string
+}
+
+const joins = new Map<ClassToken, Joined>()
+
 const joinClassTokens = (tokens: ReadonlyArray<ClassToken>): string => {
+  const first = tokens[0]
+  const last = joins.get(first)
+  if (last !== undefined && last.tokens.length === tokens.length) {
+    let same = true
+    for (let i = 1; same && i < tokens.length; i++) {
+      same = last.tokens[i] === tokens[i]
+    }
+    if (same) return last.value
+  }
   let out = ""
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i]
     if (token) out = out === "" ? token : out + " " + token
+  }
+  // A first token seen before keeps its entry, written over.
+  if (last !== undefined) {
+    last.tokens = tokens
+    last.value = out
+  } else {
+    if (joins.size >= 512) joins.clear()
+    joins.set(first, { tokens, value: out })
   }
   return out
 }
@@ -1934,6 +1962,75 @@ export const vocabulary: View.Vocabulary<Elements> = { name, tags }
  */
 export const component: Component.Define<Elements> = Component
   .withElements(vocabulary)
+
+/**
+ * A row built once, for lists of rows that differ in a few values:
+ * `View.template` with the HTML elements. `Msg` is the message type of the
+ * component that shows it, and `Values` the values that change, read from
+ * `$` in `build` and given to each call.
+ *
+ * **Example** (A table row)
+ *
+ * ```ts
+ * import { Html } from "@effect/ui/html"
+ *
+ * type Msg = { readonly _tag: "Select"; readonly id: number }
+ * const Row = Html.template<Msg, {
+ *   readonly key: string
+ *   readonly label: string
+ *   readonly selected: string | undefined
+ *   readonly select: Msg
+ * }>((h, $) =>
+ *   h.tr.key($.key).class($.selected).children(
+ *     h.td.children(h.a.on("click", $.select).children($.label))
+ *   )
+ * )
+ *
+ * const row = Row({
+ *   key: "1",
+ *   label: "First",
+ *   selected: undefined,
+ *   select: { _tag: "Select", id: 1 }
+ * })
+ * ```
+ *
+ * A slot that is an element's only child takes text, or an array of nodes,
+ * such as `h.list` returns: the layout around a list can be a template, and a
+ * render then patches only the list.
+ *
+ * **Example** (A table around its rows)
+ *
+ * ```ts
+ * import type { View } from "@effect/ui"
+ * import { Html } from "@effect/ui/html"
+ *
+ * type Msg = { readonly _tag: "Clear" }
+ * const Table = Html.template<Msg, {
+ *   readonly rows: ReadonlyArray<View.Node<Msg>>
+ * }>((h, $) =>
+ *   h.div.children(
+ *     h.button.on("click", { _tag: "Clear" }).children("Clear"),
+ *     h.table.children(h.tbody.children($.rows))
+ *   )
+ * )
+ *
+ * const table = Table({ rows: [] })
+ * ```
+ *
+ * @stability experimental
+ * @category constructors
+ * @since 0.1.0
+ */
+export const template = <Msg, Values extends Record<string, unknown>>(
+  build: (h: H<Msg>, $: Values) => View.Content<Msg, any>
+): (
+  values: Values
+) => View.Element<Msg, View.Requirements<Values[keyof Values]>> =>
+  View.makeTemplate(
+    View.makeHelper<Msg, unknown, Elements>({}, vocabulary),
+    build,
+    Templates.kernel
+  )
 
 // ---------------------------------------------------------------------------
 // refs

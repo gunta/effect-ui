@@ -1,0 +1,16 @@
+{
+  "framework": "effect-ui-v0.0.0-6413803-keyed",
+  "keyed": true,
+  "benchmark": "41_size-uncompressed",
+  "type": "size",
+  "values": {
+    "DEFAULT": {
+      "min": 193.1,
+      "max": 193.1,
+      "median": 193.1,
+      "mean": 193.1,
+      "stddev": null,
+      "values": [193.1]
+    }
+  }
+}
