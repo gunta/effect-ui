@@ -443,6 +443,42 @@ describe("Html.template", { concurrent: false }, () => {
       }
     }).pipe(Effect.scoped))
 
+  it.effect("a controlled field in a content slot given the same nodes again is restored", () =>
+    Effect.gen(function*() {
+      const Step = UiSchema.TaggedEnum({ Stepped: {} })
+      type Step = typeof Step.Type
+      const Box = Html.template<Step, {
+        readonly step: string
+        readonly body: ReadonlyArray<View.Node<Step>>
+      }>((h, $) => h.div.attr("data-step", $.step).children($.body))
+      // The same array on every render, as a list given again unchanged is.
+      let body: ReadonlyArray<View.Node<Step>> | undefined
+      const Form = Html.component({
+        name: "SameBody",
+        model: Schema.Struct({ step: Schema.Number }),
+        message: Step
+      }).make({
+        init: () => ({ step: 0 }),
+        update: ({ model }) => ({ step: model.step + 1 }),
+        view: (h, model) => {
+          body ??= [View.toNode(h.input.prop("value", "kept"))]
+          return Box({ step: String(model.step), body })
+        }
+      })
+      const app = yield* container
+      const root = yield* BrowserHost.mountEffect(Form, {}, app)
+      const field = app.querySelector<HTMLInputElement>("input")!
+      assert.strictEqual(field.value, "kept")
+      field.value = "typed"
+      // A new element of the template, its other slot changed: the field
+      // goes back to the value the view gives.
+      root.send(Step.Stepped())
+      yield* tick
+      assert.strictEqual(app.querySelector("div")!.dataset.step, "1")
+      assert.strictEqual(app.querySelector("input"), field)
+      assert.strictEqual(field.value, "kept")
+    }).pipe(Effect.scoped))
+
   it.effect("a controlled field that a kept template's content slot gains is restored", () =>
     Effect.gen(function*() {
       const Step = UiSchema.TaggedEnum({ Stepped: {} })

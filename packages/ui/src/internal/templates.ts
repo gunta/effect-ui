@@ -227,15 +227,22 @@ const patchTemplate = (
   rec.plain = false
   const before = prev.values
   const after = view.values
-  if (before === after) return
   const host = inst.tree.host
+  // Once the tree has set a property, a content slot given the same nodes
+  // again is patched anyway, so their controlled properties are set again,
+  // as a kept element's are.
+  const restores = inst.tree.restores === true
+  if (before === after && !restores) return
   // Handlers aren't among them: one is read off the values when its event comes.
   const holes = view["~t"].writes
   for (let index = 0; index < holes.length; index++) {
     const hole = holes[index]!
     const value = after[hole.slot]
     const was = before[hole.slot]
-    if (value === was) continue
+    if (
+      value === was &&
+      !(restores && hole.kind === "content" && Array.isArray(value))
+    ) continue
     if (
       hole.kind === "content" && (Array.isArray(value) || Array.isArray(was))
     ) {
