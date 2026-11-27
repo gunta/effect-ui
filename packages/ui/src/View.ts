@@ -2503,7 +2503,12 @@ export interface HelperBase<Msg, Props> {
    * `key` names an item; `selected`, if given, is the key of the selected
    * one, and `render` is told whether its item is it. An item is the same as
    * the last render's when it's the same value, compared with `===`, so a
-   * Model that keeps the items it doesn't change keeps their nodes.
+   * Model that keeps the items it doesn't change keeps their nodes. `key`
+   * must give an item the same key on every render, as the keys of any keyed
+   * list do: it may be a new function each time, but one that names the
+   * items differently, such as by another field, keeps the last render's
+   * nodes and selection for items that didn't change. Show such a list under
+   * another `render`, or with new items.
    *
    * When `items` and `selected` are both the ones of the last render, the
    * result is the last render's array, and the runtime skips the list. When
@@ -3311,15 +3316,23 @@ export interface TemplateKernel {
 }
 
 const slotMark = "\u0000@effect/ui/View/slot\u0000"
+// Ends a slot's placeholder, so that one with text after it, as in
+// `$.name + "!"`, is no slot's name but a slot inside a larger value.
+const slotEnd = "\u0000"
 
 const slotProxy = new Proxy({}, {
-  get: (_, name) => typeof name === "string" ? slotMark + name : undefined
+  get: (_, name) =>
+    typeof name === "string" ? slotMark + name + slotEnd : undefined
 })
 
-const slotOf = (value: unknown): string | undefined =>
-  typeof value === "string" && value.startsWith(slotMark)
-    ? value.slice(slotMark.length)
-    : undefined
+const slotOf = (value: unknown): string | undefined => {
+  if (
+    typeof value !== "string" || !value.startsWith(slotMark) ||
+    !value.endsWith(slotEnd)
+  ) return undefined
+  const name = value.slice(slotMark.length, -slotEnd.length)
+  return name.includes(slotEnd) ? undefined : name
+}
 
 const noSlot = (value: unknown, where: string): void => {
   if (typeof value === "string" && value.includes(slotMark)) {
@@ -3406,20 +3419,17 @@ export interface TemplateDef {
     {
       /** The child indexes from the root to the element. */
       readonly path: ReadonlyArray<number>
+      /**
+       * The number of the element's node, as a hole's `point`: a host finds
+       * which element an event came from by the node, not by where it is, as
+       * a node something else put in the row would move it.
+       */
+      readonly point: number
       readonly target: TemplateTarget
     }
   >
   /** The element without its slots: no handlers, slot attributes left out and slot text a space. */
   readonly blank: Element<any, any>
-  /** The host nodes built from `blank`, by host. */
-  readonly copies: WeakMap<object, unknown>
-  /**
-   * The last host `copies` was read for, and what it held, as most apps have
-   * one. Cleared when that host's app unmounts, so a template defined for
-   * the whole program keeps no host that's gone.
-   */
-  lastHost: object | undefined
-  lastCopy: unknown
   /** The operations a host that copies nodes renders the template with. */
   readonly kernel: TemplateKernel | undefined
 }
@@ -3536,7 +3546,7 @@ const defineTemplate = (
         "~target": true
       }
       target.v = target
-      handled.push({ path, target })
+      handled.push({ path, point: pointOf(path), target })
     }
     // A slot that is the element's only child is its content: text, or the
     // nodes of an array, such as a list `h.list` gave.
@@ -3628,11 +3638,8 @@ const defineTemplate = (
       (deepest, entry) => Math.max(deepest, entry.path.length),
       0
     ),
-    handled,
+    handled: handled.map((entry) => ({ ...entry, point: at[entry.point]! })),
     blank,
-    copies: new WeakMap(),
-    lastHost: undefined,
-    lastCopy: undefined,
     kernel
   }
 }

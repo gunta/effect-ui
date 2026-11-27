@@ -1,5 +1,12 @@
 // @vitest-environment happy-dom
-import { Command, Component, Route, Router, UiSchema } from "@effect/ui"
+import {
+  Command,
+  Component,
+  Route,
+  Router,
+  UiSchema,
+  type View
+} from "@effect/ui"
 import {
   BrowserHost,
   BrowserRouter,
@@ -587,6 +594,55 @@ describe("hot reload", { concurrent: false }, () => {
           yield* tick
           assert.strictEqual(runs, 1)
           assert.strictEqual(el.textContent, "apple=10")
+        }))
+    }))
+
+  it.live("updates a component in a template's content slot in place", () =>
+    Effect.gen(function*() {
+      sessionStorage.clear()
+      const Msg = UiSchema.TaggedEnum({ Inc: {} })
+      type Msg = typeof Msg.Type
+      const counter = (label: string) =>
+        Html.component({ name: "Counter", model: Schema.Number, message: Msg })
+          .make({
+            init: () => 0,
+            update: ($) => $.model + 1,
+            view: (h, count) =>
+              h.button.on("click", Msg.Inc()).children(`${label}=${count}`)
+          })
+      // One template for both versions of App, as a module the edit didn't
+      // touch keeps it.
+      const Frame = Html.template<Msg, {
+        readonly title: string
+        readonly body: ReadonlyArray<View.Node<Msg>>
+      }>((h, $) =>
+        h.div.children(h.span.children($.title), h.section.children($.body))
+      )
+      const app = (child: typeof Counter) =>
+        Html.component({ name: "App", model: Schema.Number, message: Msg })
+          .make({
+            init: () => 0,
+            update: ($) => $.model,
+            view: (h) => Frame({ title: "app", body: [child(h, { key: "c" })] })
+          })
+      const Counter = counter("a")
+      const first = { App: app(Counter), Counter }
+
+      yield* inContainer("template-swap", (el) =>
+        Effect.gen(function*() {
+          yield* BrowserHost.mountEffect(first.App, {}, el)
+          const button = el.querySelector("button")!
+          button.click()
+          yield* tick
+          assert.strictEqual(el.textContent, "appa=1")
+
+          const Edited = counter("b")
+          assert.isTrue(
+            hotSwap(first, { App: app(Edited), Counter: Edited })
+          )
+          yield* tick
+          assert.strictEqual(el.textContent, "appb=1")
+          assert.strictEqual(el.querySelector("button"), button)
         }))
     }))
 

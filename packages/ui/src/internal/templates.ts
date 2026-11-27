@@ -6,6 +6,7 @@
  *
  * @internal
  */
+import { checkKeys, dev } from "#dev"
 import * as View from "../View.ts"
 import {
   create,
@@ -48,17 +49,17 @@ const writeHole = (
 // A template's element, built from a copy of the nodes the host built for
 // it, with its slots written.
 const createTemplate = (inst: Instance, view: View.TemplateNode): Rec => {
-  const host = inst.tree.host
+  const tree = inst.tree
+  const host = tree.host
   const def = view["~t"]
-  let copy = def.lastHost === host ? def.lastCopy : def.copies.get(host)
-  // The first of the template on this host listens for its events.
+  let copy = tree.lastTemplate === def
+    ? tree.lastCopy
+    : (tree.copies ??= new WeakMap()).get(def)
+  // The first of the template in this tree listens for its events.
   const first = copy === undefined
-  if (first) {
-    def.copies.set(host, copy = create(inst, def.blank).node)
-    ;(inst.tree.templates ??= []).push(def)
-  }
-  def.lastHost = host
-  def.lastCopy = copy
+  if (first) tree.copies!.set(def, copy = create(inst, def.blank).node)
+  tree.lastTemplate = def
+  tree.lastCopy = copy
   const node = host.clone!(copy)
   const points = host.pointsOf!(node, def.walk)
   const values = view.values
@@ -174,6 +175,8 @@ const fillContent = (
   slot.plain = false
   const parent = rec.points![hole.owner]
   const views = nodesIn(value)
+  // As `create` checks an element's children.
+  if (dev && views.length > 1) checkKeys(inst.path, views)
   inst.tree.host.remove(parent, rec.points![hole.point])
   slot.kids = views.length > 0 ? createAll(inst, parent, views) : undefined
   slot.v = contentView(views)

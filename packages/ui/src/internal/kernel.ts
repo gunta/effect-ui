@@ -265,8 +265,16 @@ export interface Tree {
   readonly log?: Recorder | undefined
   /** `false` when `log` has no use for renders starting and ending: they aren't logged then. */
   readonly logsRenders?: boolean | undefined
-  /** The templates whose nodes this tree's host first built, which forget the host when the tree closes. */
-  templates?: Array<View.TemplateDef> | undefined
+  /**
+   * The nodes this tree's host built for each template, which its elements
+   * are copied from, and the last template read, as most renders make many
+   * elements of one. Weak, so a template made and dropped while the tree
+   * lives isn't kept, and a template kept for the whole program keeps no
+   * tree.
+   */
+  copies?: WeakMap<View.TemplateDef, unknown> | undefined
+  lastTemplate?: View.TemplateDef | undefined
+  lastCopy?: unknown
   readonly fallback?:
     | ((cause: Cause.Cause<unknown>) => View.Node<any, any>)
     | undefined
@@ -2454,19 +2462,6 @@ export const mount = (
       close(instance)
       unplace(host, container, instance.rendered!)
       host.commit?.()
-      // A template defined for the whole program would otherwise keep this
-      // host, and the container it holds, until another host renders it.
-      const templates = tree.templates
-      if (templates !== undefined) {
-        for (let index = 0; index < templates.length; index++) {
-          const def = templates[index]!
-          if (def.lastHost === host) {
-            def.lastHost = undefined
-            def.lastCopy = undefined
-          }
-        }
-        tree.templates = undefined
-      }
     }
   }
 }

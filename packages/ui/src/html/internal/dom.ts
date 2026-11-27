@@ -384,18 +384,13 @@ export const makeHost = (
   // The deepest a template's element with handlers is below its root, of
   // the templates this host rendered: -1 until it renders one.
   let templateDepth = -1
-  // How far below its row the node `rowOf` last found a row for is.
-  let rowDepth = 0
   // A node with handlers in a template is at most that far below its row,
   // so the walk is that long, and none at all in a page without templates.
   const rowOf = (node: globalThis.Node): Kernel.Rec | undefined => {
     let at: Node | null = node as Node
     for (let up = 0; up <= templateDepth; up++) {
       if (at === null || at === container) return undefined
-      if (at.$t !== undefined) {
-        rowDepth = up
-        return at.$t
-      }
+      if (at.$t !== undefined) return at.$t
       if (at.$r !== undefined) return undefined
       at = at.parentNode as Node | null
     }
@@ -412,46 +407,39 @@ export const makeHost = (
     const rec = (node as Node).$r
     if (rec !== undefined || templateDepth < 0) return rec
     const row = rowOf(node)
-    if (row?.points === undefined) return undefined
-    const handled = (row.v as View.TemplateNode)["~t"].handled
-    // With no element with handlers as deep in the row as `node`, such as
-    // the icon inside a link, there's no path to find: an event an element
-    // inside one with handlers gets, or that nothing handles, passes on.
-    let deep = false
+    const points = row?.points
+    if (points === undefined) return undefined
+    // Found by the node itself, which the row's points hold, not by where it
+    // is: a node something else put in the row, such as a translator's or an
+    // extension's, moves the ones after it. A node inside an element with
+    // handlers, such as the icon in a link, matches none, and its event
+    // passes on to that element.
+    const handled = (row!.v as View.TemplateNode)["~t"].handled
     for (let index = 0; index < handled.length; index++) {
-      if (handled[index]!.path.length === rowDepth) {
-        deep = true
-        break
+      if (points[handled[index]!.point] === node) {
+        foundRow = row
+        return handled[index]!.target as never
       }
-    }
-    if (!deep) return undefined
-    // Found by where `node` is in the row, as the row keeps no reference to
-    // its elements with handlers: a copy is made with fewer reads that way.
-    const path: Array<number> = []
-    for (let at: globalThis.Node = node; at !== row.node;) {
-      let index = 0
-      for (
-        let sibling = at.previousSibling;
-        sibling !== null;
-        sibling = sibling.previousSibling
-      ) index++
-      path.push(index)
-      at = at.parentNode!
-    }
-    find: for (let index = 0; index < handled.length; index++) {
-      const at = handled[index]!.path
-      if (at.length !== path.length) continue
-      for (let depth = 0; depth < at.length; depth++) {
-        if (at[depth] !== path[path.length - 1 - depth]) continue find
-      }
-      foundRow = row
-      return handled[index]!.target as never
     }
     return undefined
   }
 
   const elementOf = (node: globalThis.Node) =>
     recOf(node)?.v as View.Element<any, any> | undefined
+
+  // The handler `node` has for `name`: its element's, or for an element of a
+  // template whose handler is a slot, the row's value for the slot, which
+  // may be none.
+  const handlerOf = (node: globalThis.Node, name: string): unknown => {
+    const rec = recOf(node)
+    const handler = (rec?.v as View.Element<any, any> | undefined)
+      ?.handlers[name]
+    if (handler === undefined || foundRow === undefined) return handler
+    const slot = (rec as unknown as View.TemplateTarget).slots[name]
+    return slot === undefined
+      ? handler
+      : (foundRow.v as View.TemplateNode).values?.[slot]
+  }
 
   /** Applies a sending handler's options to its event. */
   const sent = (
@@ -541,7 +529,7 @@ export const makeHost = (
   const queueMove = (event: PointerEvent, path: ReadonlyArray<Node>) => {
     for (const node of path) {
       if (node === container) return
-      if (elementOf(node)?.handlers.pointermove === undefined) continue
+      if (handlerOf(node, "pointermove") === undefined) continue
       if (moves === undefined) {
         const queued = moves = new Map()
         later(() => {
@@ -571,10 +559,11 @@ export const makeHost = (
   }
 
   const accepts = (node: globalThis.Node, types: ReadonlyArray<string>) => {
-    const element = elementOf(node)
-    return element?.handlers.drop !== undefined &&
-      (element.eventOptions.drop as Html.DropTargetOptions | undefined)?.accepts
-          ?.some((type) => types.includes(type.toLowerCase())) === true
+    if (handlerOf(node, "drop") === undefined) return false
+    return (elementOf(node)!.eventOptions.drop as
+      | Html.DropTargetOptions
+      | undefined)?.accepts
+      ?.some((type) => types.includes(type.toLowerCase())) === true
   }
 
   const dropTargetOf = (event: DragEvent, path: ReadonlyArray<Node>) => {
@@ -601,7 +590,7 @@ export const makeHost = (
   }
 
   const queueOver = (element: globalThis.Element, event: DragEvent) => {
-    if (elementOf(element)?.handlers.dragover === undefined) return
+    if (handlerOf(element, "dragover") === undefined) return
     over = [element, boxOf(event, element), typesOf(event)]
     if (overFrame) return
     overFrame = true

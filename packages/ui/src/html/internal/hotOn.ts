@@ -10,7 +10,7 @@ import type * as runtime from "../../internal/runtime.ts"
 import { forgetStateCodec } from "../../internal/stateCodec.ts"
 import * as stateRestore from "../../internal/stateRestore.ts"
 import type * as MessageLog from "../../MessageLog.ts"
-import type * as View from "../../View.ts"
+import * as View from "../../View.ts"
 import type * as BrowserHost from "../BrowserHost.ts"
 
 const hotKey = Symbol.for("@effect/ui/hot")
@@ -293,6 +293,26 @@ const reuses = (
   if (!Kernel.pairs(old, view)) return false
   if (old._tag !== "Element" || !holdsChild(rec)) return true
   const next = view as View.Element<any, any>
+  // A template's element, as the browser host made it: its record holds one
+  // record for each content slot, which holds the slot's nodes. `pairs` has
+  // checked that `next` is the same template's.
+  const def = (old as View.TemplateNode)["~t"]
+  if (def !== undefined && rec.points !== undefined) {
+    const values = (next as View.TemplateNode).values
+    for (const hole of def.contents) {
+      const slot = rec.kids?.[hole.index]
+      if (slot === undefined || !holdsChild(slot)) continue
+      const value = values[hole.slot]
+      if (!Array.isArray(value)) return false
+      const views = View.isList(value) ? value : View.children(value as never)
+      const kids = slot.kids ?? []
+      if (
+        kids.length !== views.length ||
+        !kids.every((kid, index) => reuses(kid, views[index]!, resolve))
+      ) return false
+    }
+    return true
+  }
   if (old.owned?.length || next.owned?.length) return false
   const kids = rec.kids!
   return kids.length === next.children.length &&

@@ -2886,6 +2886,42 @@ describe("BrowserHost", { concurrent: false }, () => {
         ])
       }).pipe(Effect.scoped))
 
+    it.effect("a template's drop target given no drop handler leaves the drop to the one around it", () =>
+      Effect.gen(function*() {
+        const Zone = Html.template<string, {
+          readonly drop: string | undefined
+        }>((h, $) =>
+          h.div.attr("aria-label", "Zone")
+            .dropTarget({ accepts: ["application/x-todo"] })
+            // `undefined` leaves the handler out, as it leaves an attribute out.
+            .on("drop", $.drop as string)
+            .children(h.p.attr("aria-label", "Zone child").children("Zone"))
+        )
+        const Outer = Html.component({
+          name: "Outer",
+          model: Schema.Array(Schema.String),
+          message: Schema.String
+        }).make({
+          init: (): ReadonlyArray<string> => [],
+          update: ($, message) => [...$.model, message],
+          view: (h) =>
+            h.section.attr("aria-label", "Outer")
+              .dropTarget({ accepts: ["application/x-todo"] })
+              .on("drop", ({ data }) =>
+                `outer drop ${data["application/x-todo"]}`)
+              .children(Zone({ drop: undefined }))
+        })
+        const app = yield* container
+        const root = yield* BrowserHost.mountEffect(Outer, {}, app)
+        const transfer = new Transfer()
+        transfer.setData("application/x-todo", "milk")
+        const child = byLabel(app, "Zone child")
+        expect(drag(child, "dragenter", transfer)).toBe(true)
+        expect(drag(child, "drop", transfer)).toBe(true)
+        yield* tick
+        expect(root.model()).toEqual(["outer drop milk"])
+      }).pipe(Effect.scoped))
+
     it.effect("a drag of a type no target accepts is left alone, so the browser refuses the drop", () =>
       Effect.gen(function*() {
         const app = yield* container

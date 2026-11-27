@@ -212,6 +212,33 @@ describe("Html.template", { concurrent: false }, () => {
       check()
     }).pipe(Effect.scoped))
 
+  it.effect("a node something else puts in a row doesn't move its handlers", () =>
+    Effect.gen(function*() {
+      const app = yield* container
+      const root = yield* BrowserHost.mountEffect(List, {}, app)
+      root.send(Message.Set({ items: itemsOf(1, 2) }))
+      yield* tick
+      const [first, second] = app.querySelectorAll("li")
+      // A comment before the link, and an element before the button, as a
+      // translator or an extension adds: what follows them moves.
+      first!.prepend(document.createComment("annotation"))
+      second!.insertBefore(
+        document.createElement("font"),
+        second!.querySelector("button")
+      )
+      first!.querySelector("a")!.click()
+      yield* tick
+      second!.querySelector("a")!.click()
+      yield* tick
+      second!.querySelector("button")!.click()
+      yield* tick
+      assert.deepStrictEqual(root.model()!.seen, [
+        "select 1",
+        "select 2",
+        "remove 2"
+      ])
+    }).pipe(Effect.scoped))
+
   it.effect("rows inserted or removed in one place leave the others' nodes alone", () =>
     Effect.gen(function*() {
       const app = yield* container
@@ -441,6 +468,34 @@ describe("Html.template", { concurrent: false }, () => {
         yield* tick
         assert.strictEqual(app.innerHTML, html[step])
       }
+    }).pipe(Effect.scoped))
+
+  it.effect("a content slot's first nodes with one key twice fail the render", () =>
+    Effect.gen(function*() {
+      const Box = Html.template<never, {
+        readonly body: ReadonlyArray<View.Node<never>>
+      }>((h, $) => h.ul.children($.body))
+      const Twice = Html.component({
+        name: "TwiceKeyed",
+        model: Schema.Null,
+        message: Schema.Never
+      }).make({
+        init: () => null,
+        update: ($) => $.model,
+        view: (h) =>
+          Box({
+            body: [
+              View.toNode(h.li.key("a").children("1")),
+              View.toNode(h.li.key("a").children("2"))
+            ]
+          })
+      })
+      const app = yield* container
+      yield* BrowserHost.mountEffect(Twice, {}, app, {
+        fallback: (_, h) => h.text("failed")
+      })
+      yield* tick
+      assert.strictEqual(app.textContent, "failed")
     }).pipe(Effect.scoped))
 
   it.effect("a controlled field in a content slot given the same nodes again is restored", () =>
@@ -678,29 +733,74 @@ describe("Html.template", { concurrent: false }, () => {
       assert.deepStrictEqual(root.model()!.got, [false, null])
     }).pipe(Effect.scoped))
 
-  it.effect("a template keeps no unmounted app's host", () =>
-    Effect.gen(function*() {
-      const app = document.body.appendChild(document.createElement("div"))
-      yield* Effect.scoped(
-        BrowserHost.mountEffect(List, {}, app).pipe(
-          Effect.tap((root) =>
-            Effect.andThen(
-              Effect.sync(() =>
-                root.send(Message.Set({ items: itemsOf(1, 2) }))
-              ),
-              tick
-            )
+  // collectGarbage uses Node's V8 flags, unavailable on Bun and Deno.
+  const withGc = it.effect.skipIf(
+    process.versions.bun !== undefined || process.versions.deno !== undefined
+  )
+
+  withGc(
+    "a template defined for the whole program keeps no unmounted app",
+    () =>
+      Effect.gen(function*() {
+        let app: WeakRef<HTMLElement> | undefined
+        yield* Effect.gen(function*() {
+          const element = document.body.appendChild(
+            document.createElement("div")
           )
+          app = new WeakRef(element)
+          const root = yield* BrowserHost.mountEffect(List, {}, element)
+          root.send(Message.Set({ items: itemsOf(1, 2) }))
+          yield* tick
+          element.remove()
+        }).pipe(Effect.scoped)
+        // `Row` is still in use here: its definition lives on.
+        assert.strictEqual(
+          (row(undefined, itemsOf(1, 1)[0]!, false) as View.TemplateNode)["~t"]
+            .kernel !== undefined,
+          true
         )
-      )
-      app.remove()
-      const def =
-        (row(undefined, itemsOf(1, 1)[0]!, false) as View.TemplateNode)[
-          "~t"
-        ]
-      assert.isUndefined(def.lastHost)
-      assert.isUndefined(def.lastCopy)
-    }))
+        yield* collectGarbage
+        assert.isUndefined(app!.deref())
+      })
+  )
+
+  withGc(
+    "a template made by a view is dropped once no view uses it",
+    () =>
+      Effect.gen(function*() {
+        const Next = UiSchema.TaggedEnum({ Next: {} })
+        let first: WeakRef<object> | undefined
+        const Fresh = Html.component({
+          name: "Fresh",
+          model: Schema.Number,
+          message: Next
+        }).make({
+          init: () => 0,
+          update: ({ model }) => model + 1,
+          view: (_h, model) => {
+            // A new template on every render, which a module-level one would avoid.
+            const Label = Html.template<never, { readonly label: string }>((
+              h,
+              $
+            ) => h.p.children($.label))
+            const node = Label({ label: String(model) })
+            if (model === 0) {
+              first = new WeakRef((node as View.TemplateNode)["~t"])
+            }
+            return node
+          }
+        })
+        const app = yield* container
+        const root = yield* BrowserHost.mountEffect(Fresh, {}, app)
+        for (let step = 0; step < 3; step++) {
+          root.send(Next.Next())
+          yield* tick
+        }
+        assert.strictEqual(app.innerHTML, "<p>3</p>")
+        yield* collectGarbage
+        assert.isUndefined(first!.deref())
+      }).pipe(Effect.scoped)
+  )
 
   it.effect("a template made with View.template renders in the browser as any element", () =>
     Effect.gen(function*() {
@@ -735,7 +835,6 @@ describe("Html.template", { concurrent: false }, () => {
         "~t"
       ]
       assert.isUndefined(def.kernel)
-      assert.isUndefined(def.lastHost)
       root.send(Message.Label({ id: 1, label: "patched" }))
       yield* tick
       assert.strictEqual(app.innerHTML, "<p><a>patched</a></p>")
@@ -796,6 +895,28 @@ describe("Html.template", { concurrent: false }, () => {
       Html.template<Message, { readonly state: string }>((h, $) =>
         h.p.class("row", $.state)
       )
+    )
+    // Text after the slot, and two slots in one value.
+    assert.throws(() =>
+      Html.template<Message, { readonly name: string }>((h, $) =>
+        h.p.children($.name + "!")
+      )
+    )
+    assert.throws(() =>
+      Html.template<Message, { readonly state: string }>((h, $) =>
+        h.p.class($.state, "fixed")
+      )
+    )
+    assert.throws(() =>
+      Html.template<Message, { readonly state: string }>((h, $) =>
+        h.p.class($.state).class("fixed")
+      )
+    )
+    assert.throws(() =>
+      Html.template<Message, {
+        readonly first: string
+        readonly last: string
+      }>((h, $) => h.p.attr("title", $.first + $.last))
     )
   })
 })
